@@ -9,7 +9,7 @@ const root = {
   opened: true, aiActive: false, aiBusy: false, aiGeneration: 0, aiQuery: '',
   aiResult: null, aiError: '', aiProgress: '', aiReadPosition: 0, aiProcess: null,
   query: '', maxPayloadChars: 2048, maxQueryChars: 512, maxHelperPayloadChars: 262144,
-  pluginId: 'io.github.maajix.spotlight', appLibrary: null,
+  pluginId: 'eduardo.spotlight', appLibrary: null,
   settings: {aiEnabled: true, aiProvider: 'codex', aiModel: '', aiEffort: '', aiWebSearch: false},
   clipboardRows: [], fileRows: [], suggestionRows: [],
   currencySession: require('../lib/Currency.js').createSession(),

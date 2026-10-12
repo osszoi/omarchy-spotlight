@@ -181,9 +181,11 @@ PREVIEW_PROC_STAT_BYTES = 64 * 1024
 PREVIEW_LOG_LINES = 8
 PREVIEW_LOG_BYTES = 16 * 1024
 # Contents of these stay off screen; the pane shows only name, size and date.
-PREVIEW_SECRET_DIRS = (".ssh", ".gnupg", ".password-store", ".local/share/keyrings")
+PREVIEW_SECRET_DIRS = (".ssh", ".gnupg", ".password-store", ".local/share/keyrings",
+                       ".kube", ".docker", ".aws", ".codex", ".config/gh", ".config/gcloud")
 PREVIEW_SECRET_NAMES = ("id_*", "*.pem", "*.key", "*.p12", "*.pfx", "*.kdbx", ".env", ".env.*",
-                        ".netrc", ".pgpass", "*credentials*", "*secret*", "*.gpg", "*.age")
+                        ".netrc", ".pgpass", "*credentials*", "*secret*", "*.gpg", "*.age",
+                        "*.cnf", "auth.json")
 
 REMINDER_BYTES = 256 * 1024
 REMINDER_DEADLINE = 3.0
@@ -250,13 +252,13 @@ BINDINGS_DESC_CHARS = 120
 MARK_START = '-- >>> spotlight setup tour (managed; rerun via "Run Setup Tour") >>>'
 MARK_END = "-- <<< spotlight setup tour <<<"
 DISABLED_PREFIX = "-- spotlight-tour:disabled "
-TOGGLE_CMD = "omarchy-shell shell toggle io.github.maajix.spotlight '{}'"
+TOGGLE_CMD = "omarchy-shell shell toggle eduardo.spotlight '{}'"
 # A live line binding the bare Spotlight toggle; group 1 is the chord
 # literal. A bind carrying a query payload is a different shortcut and is
 # left alone.
 TOGGLE_RE = re.compile(
     r'''^\s*o\.bind\(\s*(?P<chord_quote>["'])(?P<chord>[^"']+)(?P=chord_quote)\s*,.*?'''
-    r'''(?P<command_quote>["'])omarchy-shell shell toggle io\.github\.maajix\.spotlight'''
+    r'''(?P<command_quote>["'])omarchy-shell shell toggle eduardo\.spotlight'''
     r'''(?:\s+["']?\{\}["']?)?(?P=command_quote)\s*[,)]''')
 UNBIND_RE = re.compile(r'''^\s*hl\.unbind\(\s*["']([^"']+)["']\s*\)''')
 CHORD_MODS = ("SUPER", "CTRL", "ALT", "SHIFT")

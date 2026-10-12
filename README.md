@@ -2,9 +2,14 @@
 
 **A fast, local-first command palette for Omarchy.**
 
+Fork of [maajix/omarchy-spotlight](https://github.com/maajix/omarchy-spotlight) (MIT), renamed to
+`eduardo.spotlight`. The only other difference is that the preview pane also keeps the contents of
+`~/.kube`, `~/.docker`, `~/.aws`, `~/.codex`, `~/.config/gh`, `~/.config/gcloud`, `*.cnf` and
+`auth.json` off screen. The website and documentation below are upstream's.
+
 Launch apps, switch windows, find files, search your clipboard and control your desktop from one input. Calculate, convert currencies, create reminders, search the web or ask AI without leaving Spotlight.
 
-[Website](https://maajix.github.io/omarchy-spotlight/) · [Documentation](https://maajix.github.io/omarchy-spotlight/docs/) · [Plugin marketplace](https://plugins.omarchy.org/plugin.html?id=io.github.maajix.spotlight)
+[Website](https://maajix.github.io/omarchy-spotlight/) · [Documentation](https://maajix.github.io/omarchy-spotlight/docs/)
 
 ![Spotlight showing mixed local search results](preview.png)
 
@@ -13,7 +18,7 @@ Launch apps, switch windows, find files, search your clipboard and control your 
 Requires **Omarchy 4 (Quattro)**. Core features use tools already included with Omarchy.
 
 ```bash
-omarchy plugin add https://github.com/maajix/omarchy-spotlight.git --enable
+omarchy plugin add https://github.com/osszoi/omarchy-spotlight.git --enable
 ```
 
 Press **Alt+Space** to open Spotlight. The first-run tour sets up the shortcut; if it is already taken, choose another. Search for `spotlight settings` to change sources, behavior or the shortcut later.
@@ -25,7 +30,7 @@ Under **Appearance**, **Vertical position** moves the launcher from 0% (top) to 
 If the shortcut does not open Spotlight:
 
 ```bash
-omarchy-shell shell toggle io.github.maajix.spotlight '{}'
+omarchy-shell shell toggle eduardo.spotlight '{}'
 ```
 
 ## Try it

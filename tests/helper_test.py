@@ -1152,7 +1152,7 @@ BINDS_FIXTURE = json.dumps([
     {"modmask": 4, "key": "SPACE", "submap": "", "description": "Spotlight"},
     {"modmask": 64, "key": "", "submap": "", "description": "Switch to workspace 1"},
 ]).encode("utf-8")
-TOGGLE = "omarchy-shell shell toggle io.github.maajix.spotlight '{}'"
+TOGGLE = "omarchy-shell shell toggle eduardo.spotlight '{}'"
 LUA_FIXTURE = "\n".join([
     "-- my bindings",
     'o.bind("SUPER + B", "Browser", "omarchy-launch-browser")',
@@ -1160,7 +1160,7 @@ LUA_FIXTURE = "\n".join([
     "-- Spotlight",
     'o.bind("CTRL + SPACE", "Spotlight", "%s")' % TOGGLE,
     '-- o.bind("ALT + SPACE", "Spotlight", "%s")' % TOGGLE,
-    'o.bind("SUPER + R", "Spotlight reminder", "omarchy-shell shell toggle io.github.maajix.spotlight \'{\\"query\\":\\"remind me \\"}\'")',
+    'o.bind("SUPER + R", "Spotlight reminder", "omarchy-shell shell toggle eduardo.spotlight \'{\\"query\\":\\"remind me \\"}\'")',
     "",
 ])
 MANAGED = "\n".join([
@@ -1614,7 +1614,7 @@ class BindingTests(unittest.TestCase):
         original = (
             "hl.unbind('CTRL + SPACE')\n"
             "o.bind('CTRL + SPACE', 'Spotlight', "
-            "'omarchy-shell shell toggle io.github.maajix.spotlight')"
+            "'omarchy-shell shell toggle eduardo.spotlight')"
         )
         with fake_home() as home:
             path = self._hypr(home, original)

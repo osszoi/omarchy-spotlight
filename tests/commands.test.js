@@ -58,10 +58,10 @@ test("fromPlugins keeps curated entries, skips itself and deduplicates plugin ID
     { id: "test.menu", name: "Alpha Menu" },
     { id: "test.panel", name: "Duplicate" },
     { id: "omarchy.emojis", name: "Curated" },
-    { id: "io.github.maajix.spotlight", name: "Spotlight" },
+    { id: "eduardo.spotlight", name: "Spotlight" },
     { id: "constructor", name: "Prototype Name" }
   ]
-  const entries = Commands.fromPlugins(plugins, "io.github.maajix.spotlight")
+  const entries = Commands.fromPlugins(plugins, "eduardo.spotlight")
   assert.deepEqual(entries.map(c => c.id), ["test.menu", "constructor", "test.panel"])
   const panel = entries[2]
   assert.equal(panel.kind, "summon")
@@ -80,7 +80,7 @@ test("QML discovers and launches plugins without a host registry or cross-plugin
     // and cross-plugin calls are forbidden.
     shell: { summon: () => assert.fail("scoped summon used"),
       toggle: () => assert.fail("scoped toggle used") },
-    pluginId: "io.github.maajix.spotlight", opened: true,
+    pluginId: "eduardo.spotlight", opened: true,
     pluginCommands: [{ id: "old.plugin" }], menuCommands: [],
     maxHelperPayloadChars: 524288, maxAppCandidates: 512, usage: {},
     helperArgv: args => ["python3", "/helper"].concat(args),

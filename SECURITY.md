@@ -13,7 +13,7 @@ Security fixes are provided for the current version of Spotlight and, where rele
 Users should update with:
 
 ```bash
-omarchy plugin update io.github.maajix.spotlight
+omarchy plugin update eduardo.spotlight
 ```
 
 ## Reporting a Vulnerability
@@ -22,7 +22,7 @@ Please **do not open a public GitHub issue, discussion, or pull request for an u
 
 Use GitHub's private vulnerability reporting for this repository:
 
-https://github.com/maajix/omarchy-spotlight/security/advisories/new
+https://github.com/osszoi/omarchy-spotlight/security/advisories/new
 
 If private vulnerability reporting is unavailable, open a public issue titled **Security contact request** without including vulnerability details, proof-of-concept code, logs, screenshots, or other sensitive information. A private reporting channel can then be arranged.
 

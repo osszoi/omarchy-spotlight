@@ -59,7 +59,7 @@ jobs:
           missing = required - manifest.keys()
           assert not missing, f"missing manifest fields: {sorted(missing)}"
           assert manifest["schemaVersion"] == 1
-          assert manifest["id"] == "io.github.maajix.spotlight"
+          assert manifest["id"] == "eduardo.spotlight"
           assert re.fullmatch(r"\d+\.\d+\.\d+", manifest["version"])
           assert isinstance(manifest["kinds"], list) and manifest["kinds"]
           assert isinstance(manifest["entryPoints"], dict)

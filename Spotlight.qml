@@ -44,7 +44,7 @@ Item {
   }
   property var manifest: null
 
-  readonly property string pluginId: (manifest && manifest.id) || "majix.spotlight"
+  readonly property string pluginId: (manifest && manifest.id) || "eduardo.spotlight"
   // The shell's own application library, when the host hands one over.
   //
   // Omarchy 4.0.3 gates it behind a manifest kind of "menu" — which this
