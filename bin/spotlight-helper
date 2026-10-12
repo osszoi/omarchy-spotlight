@@ -1,0 +1,3964 @@
+#!/usr/bin/env python3
+"""Bounded I/O broker for the Spotlight overlay.
+
+Spotlight is a `keepLoaded` plugin: it lives inside the long-running
+omarchy-shell process. Anything that process reads stays resident, so no read
+may be open-ended. Every file read, every subprocess and every write that
+Spotlight needs goes through this helper instead of happening in QML, and each
+one is bounded three ways before the shell ever sees a byte:
+
+  * a hard ceiling on how much is read,
+  * a wall-clock deadline with a TERM -> KILL process-group teardown,
+  * a normalised, count-limited projection as the only thing printed.
+
+Every subcommand prints exactly one JSON object on stdout and exits 0. Failure
+is `{"ok": false, "error": ...}` — the caller falls back to its defaults, so a
+hostile or broken input degrades the feature instead of the shell.
+
+Directories are opened as verified descriptors (owned by us, not group- or
+world-writable) and every step of a path is opened relative to the previous
+descriptor, so no ancestor can be swapped between the check and the use.
+Directory components may be symlinks — `~/.config` pointing into a dotfiles
+repo is a normal setup — but the descriptor they resolve to still has to pass
+the ownership check. File components are opened O_NOFOLLOW and must be regular
+files owned by us, which is what keeps a planted symlink, FIFO or device out.
+"""
+
+from contextlib import nullcontext
+import errno
+import fcntl
+import fnmatch
+import glob
+import hashlib
+import ipaddress
+import json
+import math
+import mimetypes
+import os
+import pwd
+import re
+import select
+import shlex
+import shutil
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import time
+import tempfile
+import unicodedata
+from datetime import date, datetime, timezone
+from urllib.parse import quote, urlsplit
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+from ai_artifacts import VALIDATORS as ARTIFACT_VALIDATORS, unsafe
+from system_metrics import snapshot as system_snapshot
+from gallery_images import fetch as fetch_gallery_image, IMAGE_BYTES
+
+EUID = os.geteuid()
+ACTIVE_PROC = None
+
+# ------------------------------------------------------------------ limits
+SETTINGS_BYTES = 64 * 1024
+USAGE_BYTES = 256 * 1024
+CLIPBOARD_BYTES = 8 * 1024 * 1024
+ICS_BYTES = 64 * 1024
+
+USAGE_VERSION = 2
+USAGE_KEEP = 400
+USAGE_FILE_KEEP = 100
+USAGE_CONTEXT_KEEP = 128
+USAGE_CONTEXT_HIT_KEEP = 8
+USAGE_JSON_BUDGET_BYTES = 200000
+USAGE_ID_CHARS = 512
+USAGE_CONTEXT_CHARS = 256
+USAGE_ID_RE = re.compile(r"^(?:(?:app|window|action):[^\x00-\x1f]{1,505}|file:[0-9a-f]{64})$")
+USAGE_CONTEXT_RE = re.compile(
+    r"^(?:query:|filter:(?:app|window|file|action|clipboard|web|calc|unit|reminder|calendar):)"
+    r"[^\x00-\x1f]{2,220}$"
+)
+
+CLIP_ENTRIES = 200
+CLIP_TITLE_CHARS = 120
+CLIP_TEXT_BYTES = 1024 * 1024
+
+SUGGEST_BYTES = 64 * 1024
+SUGGEST_DEADLINE = 3.0
+SUGGEST_COUNT = 8
+SUGGEST_CHARS = 200
+SUGGEST_QUERY_CHARS = 200
+
+CURRENCY_BYTES = 16 * 1024
+CURRENCY_DEADLINE = 3.0
+CURRENCY_TTL = 24 * 60 * 60
+CURRENCY_CACHE_BYTES = 64 * 1024
+CURRENCY_CACHE_KEEP = 128
+CURRENCY_CACHE_NAME = "spotlight-currency.json"
+CURRENCY_CODE_RE = re.compile(r"^[A-Z]{3}$")
+CURRENCY_PREVIEW_QUOTES = 8
+
+FILES_BYTES = 256 * 1024
+FILES_DEADLINE = 3.0
+# The shell ranks and shows only the best few of these, so this is a scan
+# pool, not a display count: raising it costs `fd` little (its own walk
+# dominates the latency, not the result cap) but is what lets a real match
+# survive being buried behind everything a bare directory walk happens to
+# find first. 400 short paths sits well under FILES_BYTES.
+FILES_COUNT = 400
+FILES_PATH_CHARS = 1024
+FILES_PATTERN_CHARS = 256
+FILES_MAX_TERMS = 8
+# Each row repeats its path across path/name/dir plus JSON structure, so 400
+# short real-world hits (35-50 KB raw from `fd`) can still project into a
+# payload several times that size — measured able to clear Spotlight.qml's
+# maxHelperPayloadChars (524288) well before hitting FILES_COUNT, on long
+# real paths. This stops row-building on real (not estimated) JSON size,
+# comfortably under that ceiling, rather than hoping FILES_COUNT alone keeps
+# the payload small enough.
+#
+# "Comfortably" has to mean at least 2x, not just "under": this is counted
+# in Python `len()` (code points), but the ceiling it protects is JS
+# `String.length` (UTF-16 code units) on the other side of the JSON — any
+# character outside the BMP counts double there and not here. Measured
+# break-even against a real emit() of a payload that is nearly all
+# non-BMP: ~265000. 200000 keeps that difference from ever mattering —
+# raising this constant without re-deriving that margin reintroduces the
+# empty-results bug this budget exists to prevent.
+FILES_JSON_BUDGET_CHARS = 200000
+
+PORTS_BYTES = 128 * 1024
+PORTS_DEADLINE = 2.0
+# ponytail: first 200 sockets only; add paging if hosts exceed this routinely.
+PORTS_COUNT = 200
+PORT_PROCESS_RE = re.compile(r'users:\(\("([^"\r\n]{1,128})",pid=(\d+)')
+
+DOCKER_BYTES = 512 * 1024
+DOCKER_DEADLINE = 3.0
+# ponytail: newest 200 containers only; add paging if this becomes limiting.
+DOCKER_COUNT = 200
+DOCKER_ID_RE = re.compile(r"^[0-9a-f]{12,64}$")
+
+SERVICES_BYTES = 512 * 1024
+SERVICES_DEADLINE = 2.0
+# ponytail: first 200 loaded services only; add paging if hosts exceed this.
+SERVICES_COUNT = 200
+SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9@._:\\][A-Za-z0-9@._:\\-]{0,179}$")
+
+MOUNTS_BYTES = 128 * 1024
+MOUNTS_DEADLINE = 2.0
+MOUNTS_COUNT = 200
+
+AUDIO_BYTES = 512 * 1024
+AUDIO_DEADLINE = 2.0
+AUDIO_COUNT = 100
+
+WIFI_BYTES = 128 * 1024
+WIFI_DEADLINE = 3.0
+WIFI_COUNT = 100
+BLUETOOTH_BYTES = 512 * 1024
+BLUETOOTH_DEADLINE = 2.0
+BLUETOOTH_COUNT = 100
+BLUETOOTH_ADDRESS_RE = re.compile(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}")
+
+SSH_CONFIG_BYTES = 64 * 1024
+SSH_KNOWN_BYTES = 256 * 1024
+SSH_FILES = 32
+SSH_HOSTS = 200
+SSH_ALIAS_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
+SSH_DIRECTIVE_RE = re.compile(r"^\s*(Host|Include)\s*(?:=\s*|\s+)(.*)$", re.I)
+
+# The preview pane: one file, entry or unit at a time, all of it bounded.
+PREVIEW_TEXT_BYTES = 16 * 1024
+PREVIEW_TEXT_LINES = 40
+PREVIEW_LINE_CHARS = 240
+PREVIEW_CLIP_CHARS = 4000
+PREVIEW_DIR_ENTRIES = 24
+PREVIEW_DIR_COUNT = 1000
+PREVIEW_IMAGE_BYTES = 32 * 1024 * 1024
+PREVIEW_CMDLINE_BYTES = 4096
+PREVIEW_PROC_STAT_BYTES = 64 * 1024
+PREVIEW_LOG_LINES = 8
+PREVIEW_LOG_BYTES = 16 * 1024
+# Contents of these stay off screen; the pane shows only name, size and date.
+PREVIEW_SECRET_DIRS = (".ssh", ".gnupg", ".password-store", ".local/share/keyrings")
+PREVIEW_SECRET_NAMES = ("id_*", "*.pem", "*.key", "*.p12", "*.pfx", "*.kdbx", ".env", ".env.*",
+                        ".netrc", ".pgpass", "*credentials*", "*secret*", "*.gpg", "*.age")
+
+REMINDER_BYTES = 256 * 1024
+REMINDER_DEADLINE = 3.0
+
+TOGGLE_BYTES = 8 * 1024
+TOGGLE_DEADLINE = 1.0
+REMINDER_COUNT = 50
+REMINDER_FIELD_CHARS = 200
+
+PLUGINS_BYTES = 256 * 1024
+PLUGINS_DEADLINE = 3.0
+# ponytail: first 200 eligible plugins; add paging if installations exceed this.
+PLUGINS_COUNT = 200
+PLUGIN_NAME_CHARS = 200
+PLUGIN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}")
+
+TLDR_BYTES = 64 * 1024
+# The first lookup of a page downloads it, so this is generous for a launcher.
+TLDR_DEADLINE = 4.0
+TLDR_EXAMPLES = 16
+TLDR_FIELD_CHARS = 512
+AI_OUTPUT_BYTES = 512 * 1024
+AI_DEADLINE = 120.0
+AI_TEXT_CHARS = 16384
+AI_REPLY_CHARS = 524288  # Must match Spotlight.maxHelperPayloadChars (UTF-16 units).
+AI_GALLERY_DEADLINE = 10.0
+AI_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,191}$")
+AI_EFFORTS = {"low", "medium", "high", "xhigh", "max", "ultra"}
+TLDR_PAGE_RE = re.compile(r"^[a-z0-9][a-z0-9._+-]{0,63}$")
+# `{{[-a|--all]}}` is an option alternation; the long form reads best.
+TLDR_OPTION_RE = re.compile(r"\{\{\[[^|\]]*\|([^\]]*)\]\}\}")
+TLDR_URL_RE = re.compile(r"More information: <(https?://[^>\s]+)>")
+# tldr marks the option letter as in "[c]reate"; a heading reads better plain.
+TLDR_HINT_RE = re.compile(r"\[(\w)\]")
+
+ICS_STAMP_RE = re.compile(r"^[0-9TZ]{1,32}$")
+
+# ~/.config/hypr/bindings.lua is edited only through a delimited block at EOF
+# plus a distinctive comment prefix on the line it replaces, so the whole
+# edit reverts byte for byte (cmd_revert_binding).
+BINDINGS_BYTES = 256 * 1024
+# Whether a chord is free is a question about the compositor, so it is asked
+# of the compositor: Hyprland's IPC socket answers `j/binds` with its live
+# bind table. The socket is what fails when Hyprland is unreachable, and
+# failing is the point - `omarchy-menu-keybindings --print` formats a menu
+# and still exits 0 printing only its static entries when the dynamic query
+# dies, which reads downstream as "every other chord is free".
+#
+# The socket alone is not complete: Hyprland 0.56 reports `key: ""` for the
+# 59 binds its text mode spells `SUPER + code:10`, so chords named by
+# keycode are invisible in JSON and their keycodes are not exposed either.
+# --print resolves those against the active keymap, so it is merged in - but
+# only to *add* chords, and only once the socket has already answered. A
+# short --print can then subtract from the table; it can never turn an
+# occupied chord into a free one.
+HYPR_SOCKET_NAME = ".socket.sock"
+HYPR_BINDS_BYTES = 4 * 1024 * 1024
+HYPR_BINDS_DEADLINE = 2.0
+# Hyprland's modmask bits for the modifiers a chord here can name.
+HYPR_MODMASK = ((1, "SHIFT"), (4, "CTRL"), (8, "ALT"), (64, "SUPER"))
+BINDINGS_PRINT_BYTES = 64 * 1024
+BINDINGS_PRINT_DEADLINE = 3.0
+BINDINGS_DESC_CHARS = 120
+MARK_START = '-- >>> spotlight setup tour (managed; rerun via "Run Setup Tour") >>>'
+MARK_END = "-- <<< spotlight setup tour <<<"
+DISABLED_PREFIX = "-- spotlight-tour:disabled "
+TOGGLE_CMD = "omarchy-shell shell toggle io.github.maajix.spotlight '{}'"
+# A live line binding the bare Spotlight toggle; group 1 is the chord
+# literal. A bind carrying a query payload is a different shortcut and is
+# left alone.
+TOGGLE_RE = re.compile(
+    r'''^\s*o\.bind\(\s*(?P<chord_quote>["'])(?P<chord>[^"']+)(?P=chord_quote)\s*,.*?'''
+    r'''(?P<command_quote>["'])omarchy-shell shell toggle io\.github\.maajix\.spotlight'''
+    r'''(?:\s+["']?\{\}["']?)?(?P=command_quote)\s*[,)]''')
+UNBIND_RE = re.compile(r'''^\s*hl\.unbind\(\s*["']([^"']+)["']\s*\)''')
+CHORD_MODS = ("SUPER", "CTRL", "ALT", "SHIFT")
+CHORD_ALIASES = {"WIN": "SUPER", "LOGO": "SUPER", "MOD4": "SUPER",
+                 "CONTROL": "CTRL", "MOD1": "ALT"}
+# Canonical chord as written into bindings.lua: modifiers in CHORD_MODS
+# order, then exactly one key.
+CHORD_RE = re.compile(
+    r"^(?:SUPER \+ )?(?:CTRL \+ )?(?:ALT \+ )?(?:SHIFT \+ )?"
+    r"(?:[A-Z0-9]|SPACE|RETURN|TAB|F(?:[1-9]|1[0-2])|UP|DOWN|LEFT|RIGHT|BACKSPACE|DELETE|PRINT)$")
+
+# The packaged list of desktop ids Omarchy keeps out of its own launcher.
+# It lives under /usr/share, so it is the one read that is not ours: root
+# owns it, and root is the only other owner any read here will accept.
+OMARCHY_FALLBACK_PATH = "/usr/share/omarchy"
+HIDES_PARTS = ("default", "omarchy")
+HIDES_NAME = "launcher.hides"
+HIDES_BYTES = 64 * 1024
+HIDES_COUNT = 400
+HIDES_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
+SYSTEM_OWNERS = (0, EUID)
+
+# The real Omarchy root-menu tree (JSONC: default + a user-writable
+# extension, merged the same way Menu.qml's own MenuModel.js does - later
+# entries override earlier fields, not whole entries). Read-only: nothing
+# here is ever written back.
+MENU_PARTS = ("default", "omarchy")
+MENU_NAME = "omarchy-menu.jsonc"
+MENU_USER_PARTS = (".config", "omarchy", "extensions")
+MENU_JSONC_BYTES = 256 * 1024
+MENU_MAX_ITEMS = 400
+MENU_SKIP_PREFIXES = ("install.", "remove.", "system.")
+# Known collisions with lib/Commands.js's own curated entries, found by
+# review, not by construction (no general dedup pass exists - a title match
+# alone cannot tell "same command, different label" from "different command,
+# same label"). learn.keybindings duplicates the curated `keys` row exactly;
+# trigger.screensaver is worse than a duplicate - it *toggles* an active
+# screensaver off, while the curated row *starts* one, so the same title
+# would mean opposite things depending on which row a user happened to
+# click. Extend this list as more surface; it is not a promise of
+# completeness.
+# trigger.toggle.screensaver, not trigger.screensaver - found by review, a
+# typo'd id here means the skip is a no-op (the tautological form of "not
+# in this list" that a test asserting against the list itself cannot catch:
+# it passes for a nonexistent id just as easily as for a real one). Verify
+# skip decisions against the emitted title set, not against this list.
+# setup.keybindings is included for the same collision reason but a
+# different resolution (see its own comment at the callsite) - it survives
+# the curated `keys` row's title but does something different (edits
+# bindings.lua rather than viewing keybindings), so it is dropped rather
+# than mislabeled.
+MENU_SKIP_IDS = ("learn.keybindings", "trigger.toggle.screensaver", "setup.keybindings")
+# Only omarchy's own wrapped commands - the same posture Commands.js already
+# committed to (its own comment: no Suspend row, because a bare `systemctl
+# suspend` would cost the marketplace listing its automatic Verified status).
+# Pulling the menu tree in wholesale would silently reintroduce exactly that
+# without this gate: the tree's own system.suspend/system.hibernate entries
+# call `systemctl` directly. (In practice system.* is excluded above anyway -
+# Commands.js already curates that whole subtree by hand - but the gate holds
+# even if that changes.)
+MENU_ACTION_PREFIX = "omarchy-"
+MENU_ARGV_TOKENS = 12
+MENU_ARGV_CHARS = 512
+MENU_LABEL_CHARS = 200
+MENU_BREADCRUMB_DEPTH = 6
+# Each ancestor label is clamped before joining into a subtitle - a leaf's
+# own label is bounded by MENU_LABEL_CHARS, but an *ancestor* label, shared
+# by every one of its descendants, was not bounded at all: found by review,
+# a single oversized ancestor label (real risk only via the user's own
+# extension file, but still real) multiplies across every child under it and
+# can blow well past the JSON budget below on its own.
+MENU_BREADCRUMB_LABEL_CHARS = 60
+MENU_PKG_LIST_DEADLINE = 2.0
+MENU_PKG_LIST_BYTES = 512 * 1024
+# Same reasoning as bin/spotlight-helper's file-search budget (see
+# FILES_JSON_BUDGET_CHARS): row count alone does not bound serialized JSON
+# size, and Spotlight.qml rejects the whole reply above maxHelperPayloadChars
+# (524288) - found by review, a single very long ancestor label (see
+# MENU_BREADCRUMB_LABEL_CHARS above) was enough to build a 400-item reply
+# past that ceiling from a 22 KB source file. This stops row-building on
+# real (not estimated) JSON size directly; margin reasoning matches
+# FILES_JSON_BUDGET_CHARS's comment (Python len() vs JS String.length).
+MENU_JSON_BUDGET_CHARS = 200000
+# Shell metacharacters that only mean anything when they appear outside of
+# any quoting - found by review (round 2), rejecting them unconditionally
+# (a plain regex over the raw string, run before tokenising) meant a
+# perfectly literal, harmless value inside quotes - a URL query string like
+# 'https://x/?a=1&b=2' - silently vanished from the catalogue too, the same
+# false-negative failure this module otherwise goes out of its way to
+# avoid. ';'/'<'/'>'/newline/backslash/backtick are rejected the same way,
+# even though real Bash would also reject some of these unquoted forms
+# outright - the point here is never to guess at shell semantics, so an
+# unquoted occurrence of any of them is treated as "this needs a real
+# shell" rather than parsed further.
+MENU_UNQUOTED_REJECT_CHARS = frozenset("|&;()<>`\\*?{}[]#\n")
+# Bash's own default word separators (IFS), not Python's broader isspace() -
+# found by review, isspace() is also true for \r/\v/\f, which Bash treats as
+# ordinary characters *inside* a word, not separators; using it here split
+# one argument into two on any of those three, the same class of bug as the
+# \n-consumed-by-isspace() regression, just narrower (an escape a real
+# extension author would have to write on purpose, not something a CRLF
+# line ending in the JSON source could ever trigger - the \r there sits
+# outside the parsed string value).
+MENU_WORD_SEP = " \t"
+# Reserved words are only shell syntax in command position, but this module
+# does not track command position - rejecting them as bare, wholly-unquoted
+# tokens (never inside quotes, where they are ordinary literal arguments)
+# is the conservative stand-in used instead.
+MENU_SHELL_KEYWORDS = frozenset({"if", "then", "elif", "fi"})
+# A '$' only starts a real expansion when followed by something that could
+# begin one (a name, `{`, `(`, or a Bash special parameter) - anything else
+# right after it (end of string, a closing quote, punctuation) is a literal
+# dollar sign in real Bash too. Needed to correctly handle the quote-
+# concatenation trick found by review: `'$'HOME/a` is a single-quoted
+# literal `$` immediately followed by unquoted `HOME/a` (no `$` in front of
+# it, so no expansion) - Bash's own word-joining rule glues these into one
+# token, `$HOME/a`, entirely literal. A naive "does the joined token
+# contain $HOME" check (this module's previous approach) cannot tell that
+# apart from a real `$HOME` reference and expanded it wrongly.
+MENU_DOLLAR_EXPANSION_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_{(@*#?$!-0123456789"
+)
+MENU_WHEN_PKG_RE = re.compile(r"^(!\s*)?omarchy-pkg-present\s+(\S+)$")
+MENU_WHEN_CMD_RE = re.compile(r"^(!\s*)?omarchy-cmd-present\s+(\S+)$")
+# The path may be quoted the normal Bash way (`[[ -d "$HOME/foo" ]]`, or,
+# for a path containing a space, has to be) - found by review, treating the
+# quotes as part of the path made every quoted condition evaluate as though
+# the path did not exist; matched as two alternatives (quoted allows spaces,
+# unquoted does not) rather than one pattern, since a real entry in the
+# shipped tree quotes a path with a space in it. Group 3 is the quote
+# character itself (or None if unquoted) - _menu_when_allows uses it to
+# decide whether $HOME/~ inside the path may be expanded at all.
+MENU_WHEN_PATH_RE = re.compile(r'^\[\[\s*(!\s*)?-([df])\s+(?:(["\'])(.*?)\3|(\S+))\s*\]\]$')
+# $HOME must end at a word boundary - found by review, a plain substring
+# replace turned $HOMEDIR (a different, unrelated variable name that merely
+# starts with the same four letters) into a fabricated path instead of
+# being left as an unresolved $ and rejected.
+MENU_HOME_VAR_RE = re.compile(r"\$HOME\b")
+
+
+class Denied(Exception):
+    """Any boundary violation. Always fails closed."""
+
+
+# ------------------------------------------------------------ descriptors
+def _verify_dir(fd, label, owners=(EUID,)):
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode):
+        raise Denied("%s is not a directory" % label)
+    if st.st_uid not in owners:
+        raise Denied("%s is not owned by an accepted user" % label)
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise Denied("%s is group- or world-writable" % label)
+
+
+def home_fd():
+    home = os.environ.get("HOME", "")
+    if not home.startswith("/"):
+        raise Denied("HOME is not an absolute path")
+    fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        _verify_dir(fd, "HOME")
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
+def dir_at(parent, name, create=False):
+    """Open `name` under `parent` as a verified directory descriptor."""
+    if create:
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise Denied("cannot create %s: %s" % (name, exc.strerror))
+    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=parent)
+    try:
+        _verify_dir(fd, name)
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
+def walk(parts, create=False):
+    """Resolve a chain of directory names below $HOME, one descriptor at a time."""
+    fd = home_fd()
+    try:
+        for part in parts:
+            nxt = dir_at(fd, part, create=create)
+            os.close(fd)
+            fd = nxt
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def system_dir(path):
+    """Open an absolute system directory, verifying every component in turn.
+
+    Same walk as walk(), one descriptor per component so no ancestor can be
+    swapped between the check and the use, with root allowed as an owner
+    alongside us. Nothing outside Omarchy's own install prefix is read this
+    way, and nothing read this way is ever written.
+    """
+    if not path.startswith("/"):
+        raise Denied("system path is not absolute")
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        _verify_dir(fd, "/", SYSTEM_OWNERS)
+        for part in [p for p in path.split("/") if p]:
+            if part == "..":
+                raise Denied("system path escapes upward")
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+            _verify_dir(fd, part, SYSTEM_OWNERS)
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
+def read_file(dirfd, name, cap, owners=(EUID,)):
+    """Read at most `cap` bytes from a regular file we own, never following a symlink."""
+    try:
+        # O_NONBLOCK so a FIFO planted at this name cannot block the open
+        # itself; the S_ISREG check below then rejects it outright.
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                     dir_fd=dirfd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EMLINK):
+            raise Denied("%s is a symlink" % name)
+        raise Denied("cannot open %s: %s" % (name, exc.strerror))
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise Denied("%s is not a regular file" % name)
+        if st.st_uid not in owners:
+            raise Denied("%s is not owned by an accepted user" % name)
+        if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise Denied("%s is group- or world-writable" % name)
+        if st.st_size > cap:
+            raise Denied("%s is larger than %d bytes" % (name, cap))
+        os.set_blocking(fd, True)
+        chunks = []
+        total = 0
+        while total <= cap:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            chunks.append(chunk)
+        if total > cap:
+            raise Denied("%s grew past %d bytes while reading" % (name, cap))
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def read_json(dirfd, name, cap, fallback):
+    raw = read_file(dirfd, name, cap)
+    if raw is None:
+        return fallback
+    try:
+        return json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        return fallback
+
+
+def lock_at(dirfd, name, blocking=True):
+    """An exclusive advisory lock on a regular file we own. Never truncates."""
+    fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                 0o600, dir_fd=dirfd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != EUID:
+            raise Denied("%s is not a regular file owned by this user" % name)
+        fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
+def write_atomic(dirfd, name, payload, mode=0o600):
+    """Publish `payload` at `name` by renaming a private temp, dir-fd-relatively."""
+    tmp = ".%s.tmp.%d" % (name, os.getpid())
+    try:
+        os.unlink(tmp, dir_fd=dirfd)
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                 0o600, dir_fd=dirfd)
+    try:
+        view = memoryview(payload)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fchmod(fd, mode)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        os.replace(tmp, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+    except Exception:
+        try:
+            os.unlink(tmp, dir_fd=dirfd)
+        except OSError:
+            pass
+        raise
+    os.fsync(dirfd)
+
+
+def write_new(dirfd, name, payload):
+    """Create one private regular file without replacing an existing name."""
+    try:
+        fd = os.open(name,
+                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     0o600, dir_fd=dirfd)
+    except FileExistsError:
+        read_file(dirfd, name, SETTINGS_BYTES)
+        return False
+    try:
+        view = memoryview(payload)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.fsync(dirfd)
+    return True
+
+
+# ------------------------------------------------------------ subprocesses
+def run_bounded(argv, cap, deadline, stdin_bytes=None, want_status=False, on_line=None,
+                merge_stderr=False):
+    """Run `argv`, returning at most `cap` bytes of stdout within `deadline`.
+
+    The child gets its own session, so the deadline tears down the whole
+    process group rather than just the leader — an `fd` descendant cannot
+    outlive the call. Reaching either bound is not
+    an error: the caller works with the bounded prefix.
+
+    `want_status` adds the child's exit status to the tuple. A caller that
+    reads absence in the output as a fact about the world needs it: a
+    command that runs and fails writes nothing, which is indistinguishable
+    from a command that ran and found nothing. None means it never exited
+    on its own and the teardown took it.
+
+    `merge_stderr` reads the child's stderr into the same bounded stream,
+    for commands such as `docker logs` that relay a program's stderr there.
+    """
+    global ACTIVE_PROC
+    end = time.monotonic() + deadline
+    blocked = {signal.SIGINT, signal.SIGTERM}
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT if merge_stderr else subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        ACTIVE_PROC = proc
+    except OSError as exc:
+        raise Denied("cannot run %s: %s" % (argv[0], exc.strerror))
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+
+    out = proc.stdout
+    try:
+        pending_input = memoryview(stdin_bytes or b"")
+        input_fd = proc.stdin.fileno() if proc.stdin is not None else None
+        if input_fd is not None:
+            os.set_blocking(input_fd, False)
+            if not pending_input:
+                proc.stdin.close()
+                input_fd = None
+        fd = out.fileno()
+        os.set_blocking(fd, False)
+        chunks = []
+        total = 0
+        truncated = False
+        pending_line = b""
+
+        while True:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                truncated = True
+                break
+            ready, writable, _ = select.select(
+                [fd], [input_fd] if input_fd is not None else [], [], min(remaining, 0.25))
+            if writable:
+                try:
+                    written = os.write(input_fd, pending_input[:65536])
+                    pending_input = pending_input[written:]
+                except BlockingIOError:
+                    pass
+                except OSError:
+                    pending_input = pending_input[:0]
+                if not pending_input:
+                    proc.stdin.close()
+                    input_fd = None
+            if not ready:
+                continue
+            try:
+                chunk = os.read(fd, 65536)
+            except BlockingIOError:
+                continue
+            except OSError:
+                break
+            if not chunk:
+                break
+            room = cap - total
+            if len(chunk) >= room:
+                chunks.append(chunk[:room])
+                truncated = True
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if on_line:
+                pending_line += chunk
+                while b"\n" in pending_line:
+                    line, pending_line = pending_line.split(b"\n", 1)
+                    on_line(line)
+        if on_line and pending_line and not truncated:
+            on_line(pending_line)
+        result = (b"".join(chunks), truncated)
+    finally:
+        _reap(proc)
+        if proc.stdin is not None:
+            proc.stdin.close()
+        if ACTIVE_PROC is proc:
+            ACTIVE_PROC = None
+        try:
+            out.close()
+        except OSError:
+            pass
+    if want_status:
+        return result[0], result[1], proc.returncode
+    return result
+
+
+def _reap(proc):
+    """TERM the whole process group, then KILL it, then wait. Never leaves a child."""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+    try:
+        proc.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        pass
+
+    # Always address the group once more: its leader may have exited while a
+    # descendant remains alive with the same process-group id.
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _handle_termination(signum, _frame):
+    proc = ACTIVE_PROC
+    if proc is not None:
+        _reap(proc)
+    raise SystemExit(128 + signum)
+
+
+# --------------------------------------------------------------- clamping
+def clamp_text(value, chars):
+    s = "" if value is None else str(value)
+    s = "".join(ch for ch in s if ch == "\t" or ch >= " " or ch == "\n")
+    return s[:chars]
+
+
+def clamp_int(value, low, high, default):
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(high, n))
+
+
+def clamp_bool(value, default):
+    return bool(value) if isinstance(value, bool) else default
+
+
+def read_stdin(cap):
+    data = sys.stdin.buffer.read(cap + 1)
+    if len(data) > cap:
+        raise Denied("stdin exceeded %d bytes" % cap)
+    return data
+
+
+def emit(payload):
+    payload["ok"] = True
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    sys.stdout.write("\n")
+
+
+# ------------------------------------------------------------- normalizers
+def normalize_settings(parsed):
+    out = {
+        "webSuggestions": False,
+        "currencyRates": True,
+        "searchEngine": "g",
+        "defaultCurrency": "",
+        "fileSearch": True,
+        "fileSearchAlways": True,
+        "clipboardSearch": True,
+        "clipboardSearchAlways": True,
+        "previewPane": True,
+        "reduceMotion": False,
+        "learningEnabled": True,
+        "aiEnabled": False,
+        "aiProvider": "claude",
+        "aiModel": "",
+        "aiEffort": "",
+        "aiWebSearch": False,
+        "artifactSettings": {"weather": {"defaultLocation": ""}},
+        "maxResults": 20,
+        "maxApps": 8,
+        "maxSuggestions": 4,
+        "verticalPosition": 50,
+        "horizontalPosition": 50,
+        "setupCompleted": False,
+    }
+    if not isinstance(parsed, dict):
+        return out
+    out["webSuggestions"] = clamp_bool(parsed.get("webSuggestions"), False)
+    out["currencyRates"] = clamp_bool(parsed.get("currencyRates"), True)
+    out["setupCompleted"] = clamp_bool(parsed.get("setupCompleted"), False)
+    out["fileSearch"] = clamp_bool(parsed.get("fileSearch"), True)
+    out["fileSearchAlways"] = clamp_bool(parsed.get("fileSearchAlways"), True)
+    out["clipboardSearch"] = clamp_bool(parsed.get("clipboardSearch"), True)
+    out["clipboardSearchAlways"] = clamp_bool(parsed.get("clipboardSearchAlways"), True)
+    out["previewPane"] = clamp_bool(parsed.get("previewPane"), True)
+    out["reduceMotion"] = clamp_bool(parsed.get("reduceMotion"), False)
+    out["learningEnabled"] = clamp_bool(parsed.get("learningEnabled"), True)
+    out["aiEnabled"] = clamp_bool(parsed.get("aiEnabled"), False)
+    out["aiWebSearch"] = clamp_bool(parsed.get("aiWebSearch"), False)
+    artifact_settings = parsed.get("artifactSettings")
+    weather_settings = artifact_settings.get("weather") if isinstance(artifact_settings, dict) else None
+    location = weather_settings.get("defaultLocation") if isinstance(weather_settings, dict) else None
+    if (isinstance(location, str) and len(location) <= 120 and location == location.strip()
+            and not any(ord(char) < 32 or unicodedata.category(char) == "Cf" for char in location)):
+        out["artifactSettings"]["weather"]["defaultLocation"] = location
+    if parsed.get("aiProvider") in ("claude", "codex"):
+        out["aiProvider"] = parsed["aiProvider"]
+    if isinstance(parsed.get("aiModel"), str) and AI_MODEL_RE.fullmatch(parsed["aiModel"]):
+        out["aiModel"] = parsed["aiModel"]
+    if (isinstance(parsed.get("aiEffort"), str) and parsed["aiEffort"] in AI_EFFORTS
+            and (out["aiProvider"] == "codex" or parsed["aiEffort"] != "ultra")):
+        out["aiEffort"] = parsed["aiEffort"]
+    out["maxResults"] = clamp_int(parsed.get("maxResults"), 8, 50, 20)
+    out["maxApps"] = clamp_int(parsed.get("maxApps"), 3, 24, 8)
+    out["maxSuggestions"] = clamp_int(parsed.get("maxSuggestions"), 0, SUGGEST_COUNT, 4)
+    for key in ("verticalPosition", "horizontalPosition"):
+        position = parsed.get(key)
+        if isinstance(position, int) and not isinstance(position, bool):
+            out[key] = clamp_int(position, 0, 100, 50)
+    engine = parsed.get("searchEngine")
+    if isinstance(engine, str) and re.match(r"^[A-Za-z]{1,8}$", engine):
+        out["searchEngine"] = engine.lower()
+    currency = parsed.get("defaultCurrency")
+    if isinstance(currency, str) and re.fullmatch(r"[A-Za-z]{3}", currency.strip()):
+        out["defaultCurrency"] = currency.strip().upper()
+    return out
+
+
+def normalize_usage(parsed):
+    """Normalize V2 learning data and migrate the old flat usage map."""
+    if not isinstance(parsed, dict):
+        parsed = {}
+    now = int(time.time() * 1000)
+    is_v2 = parsed.get("version") == USAGE_VERSION
+    source = parsed.get("items", {}) if is_v2 else parsed
+    if not isinstance(source, dict):
+        source = {}
+
+    candidates = []
+    for source_key, value in list(source.items())[:USAGE_KEEP * 4]:
+        key = source_key
+        if not is_v2:
+            if isinstance(key, str) and key.startswith("cmd:"):
+                key = "action:" + key[4:]
+            elif not isinstance(key, str) or not key.startswith("app:"):
+                continue
+        if not isinstance(key, str) or len(key) > USAGE_ID_CHARS or not USAGE_ID_RE.match(key):
+            continue
+        if not isinstance(value, dict):
+            continue
+        count = clamp_int(value.get("count"), 0, 1000000, 0)
+        last = clamp_int(value.get("last"), 0, now + 86400000, 0)
+        if count <= 0:
+            continue
+        entry = {"count": count, "last": last}
+        if key.startswith("file:"):
+            meta = value.get("meta")
+            path = meta.get("path") if isinstance(meta, dict) else None
+            if (not isinstance(path, str) or not path.startswith("/")
+                    or len(path) > FILES_PATH_CHARS or path_fingerprint(path) != key[5:]
+                    or not os.path.exists(path)):
+                continue
+            entry["meta"] = {
+                "path": path,
+                "name": clamp_text(os.path.basename(path), 512),
+                "dir": clamp_text(os.path.dirname(path) or "/", FILES_PATH_CHARS),
+                "isDir": os.path.isdir(path),
+            }
+        candidates.append((key, entry))
+
+    candidates.sort(key=lambda item: (-item[1]["last"], -item[1]["count"], item[0]))
+    items = {}
+    files = 0
+    for key, entry in candidates:
+        if key.startswith("file:"):
+            files += 1
+            if files > USAGE_FILE_KEEP:
+                continue
+        if len(items) >= USAGE_KEEP:
+            break
+        items[key] = entry
+
+    contexts = []
+    raw_contexts = parsed.get("contexts", {}) if is_v2 else {}
+    if isinstance(raw_contexts, dict):
+        for context_key, raw_hits in list(raw_contexts.items())[:USAGE_CONTEXT_KEEP * 4]:
+            if (not isinstance(context_key, str) or len(context_key) > USAGE_CONTEXT_CHARS
+                    or not USAGE_CONTEXT_RE.match(context_key) or not isinstance(raw_hits, dict)):
+                continue
+            hits = []
+            for item_id, value in list(raw_hits.items())[:USAGE_CONTEXT_HIT_KEEP * 4]:
+                if item_id not in items or not isinstance(value, dict):
+                    continue
+                count = clamp_int(value.get("count"), 0, 1000000, 0)
+                last = clamp_int(value.get("last"), 0, now + 86400000, 0)
+                if count > 0:
+                    hits.append((item_id, {"count": count, "last": last}))
+            hits.sort(key=lambda item: (-item[1]["last"], -item[1]["count"], item[0]))
+            kept_hits = dict(hits[:USAGE_CONTEXT_HIT_KEEP])
+            if kept_hits:
+                contexts.append((context_key, kept_hits,
+                                 max(hit["last"] for hit in kept_hits.values())))
+    contexts.sort(key=lambda item: (-item[2], item[0]))
+    out = {
+        "version": USAGE_VERSION,
+        "items": items,
+        "contexts": {key: hits for key, hits, _ in contexts[:USAGE_CONTEXT_KEEP]},
+    }
+
+    # Count limits normally fit comfortably; the serialized-byte check is the
+    # final hard stop for long paths and context keys.
+    while len(json.dumps(out, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > USAGE_JSON_BUDGET_BYTES:
+        if out["contexts"]:
+            out["contexts"].pop(next(reversed(out["contexts"])))
+        elif out["items"]:
+            dropped = next(reversed(out["items"]))
+            out["items"].pop(dropped)
+        else:
+            break
+    return out
+
+
+def path_fingerprint(path):
+    return hashlib.sha256(path.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+# ------------------------------------------------------------- omarchy menu
+def _menu_strip_jsonc(raw):
+    """JSONC -> JSON: line comments and trailing commas, nothing else.
+
+    Same two transformations as MenuModel.js's own stripJsonc, so a file the
+    real menu accepts parses here the same way - not the identical regexes
+    (this one keeps the trailing newline the JS version consumes), just the
+    same net effect on any real menu file.
+    """
+    text = raw.decode("utf-8", "replace") if raw is not None else ""
+    text = re.sub(r"^[ \t]*//[^\n]*$", "", text, flags=re.M)
+    text = re.sub(r",(\s*[}\]])", r"\1", text)
+    return text
+
+
+def _menu_normalize_item(item_id, entry):
+    """Same normalization MenuModel.js's own normalizeItem does, applied per
+    source, before merging with the other one - not after.
+
+    Every recognised field is always present here (empty string/list when
+    the source did not set it), which is what makes the merge in
+    _menu_merge correct: an extension entry that reuses an id to turn an
+    action into a link (sets `target`, does not repeat `action`) has to
+    actually clear the inherited action, not just add `target` next to it.
+    Found by review: merging un-normalized dicts kept the old action alive
+    under the new label, because a field simply absent from the override
+    never overwrote the default's value for that field. `kind` is computed
+    here, per source, for the same reason `action`/`target` are - it is
+    itself just another field that the later source's own normalization
+    overwrites on merge, exactly matching what the real menu does.
+    """
+    aliases = entry.get("aliases")
+    if isinstance(aliases, list):
+        aliases = [a for a in aliases if isinstance(a, str) and a]
+    elif isinstance(aliases, str) and aliases:
+        aliases = [aliases]
+    else:
+        aliases = []
+    parent = entry.get("parent")
+    if not isinstance(parent, str):
+        if item_id == "root":
+            parent = ""
+        elif "." in item_id:
+            parent = item_id.rsplit(".", 1)[0]
+        else:
+            parent = "root"
+    action = entry.get("action")
+    action = action if isinstance(action, str) else ""
+    target = entry.get("target")
+    target = target if isinstance(target, str) else ""
+    label = entry.get("label")
+    label = label if isinstance(label, str) and label else item_id
+    return {
+        "parent": parent,
+        "kind": "action" if action else ("link" if target else "menu"),
+        "icon": entry.get("icon") if isinstance(entry.get("icon"), str) else "",
+        "label": label,
+        "target": target,
+        "action": action,
+        "provider": entry.get("provider") if isinstance(entry.get("provider"), str) else "",
+        "aliases": aliases,
+        "when": entry.get("when") if isinstance(entry.get("when"), str) else "",
+    }
+
+
+def _menu_parse_items(raw):
+    """Raw JSONC bytes -> {id: normalized-entry-dict}. Never raises; bad
+    input is empty.
+    """
+    text = _menu_strip_jsonc(raw)
+    if not text.strip():
+        return {}
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    source = parsed.get("items") if isinstance(parsed.get("items"), dict) else parsed
+    out = {}
+    for item_id, entry in source.items():
+        if not isinstance(item_id, str) or not isinstance(entry, dict):
+            continue
+        out[item_id] = _menu_normalize_item(item_id, entry)
+    return out
+
+
+def _menu_read_default():
+    base = os.environ.get("OMARCHY_PATH", "").strip() or OMARCHY_FALLBACK_PATH
+    fd = system_dir(base.rstrip("/") + "/" + "/".join(MENU_PARTS))
+    try:
+        return read_file(fd, MENU_NAME, MENU_JSONC_BYTES, SYSTEM_OWNERS)
+    finally:
+        os.close(fd)
+
+
+def _menu_read_user():
+    """The user's own extension file. Its directory is allowed not to exist
+    yet - most users never touch this - which is not the same failure as a
+    directory that exists but fails ownership/permission checks, so only the
+    former is swallowed here.
+    """
+    try:
+        fd = walk(list(MENU_USER_PARTS))
+    except FileNotFoundError:
+        return None
+    try:
+        return read_file(fd, MENU_NAME, MENU_JSONC_BYTES)
+    finally:
+        os.close(fd)
+
+
+def _menu_merge(default_items, user_items):
+    """Field-by-field merge, later source wins - same semantics as
+    MenuModel.js's mergeMenuSources: reusing an id extends/overrides it, it
+    does not replace it outright.
+    """
+    merged = {}
+    order = []
+    for source in (default_items, user_items):
+        for item_id, entry in source.items():
+            if item_id not in merged:
+                order.append(item_id)
+                merged[item_id] = {}
+            merged[item_id].update(entry)
+    return merged, order
+
+
+def _menu_title(label, argv):
+    restart = any(os.path.basename(token).startswith("omarchy-restart-") for token in argv)
+    return "Restart " + label if restart and not label.lower().startswith("restart") else label
+
+
+def _menu_breadcrumb(item_id, merged):
+    """Ancestor labels, root-to-parent, joined for a subtitle - `Style ›
+    Font` rather than a bare `Font`, since dozens of leaves share generic
+    labels (`Default`, `Theme`, `Chrome`) that only their place in the tree
+    disambiguates. Each ancestor label is clamped on its own - unlike a
+    leaf's own label, an ancestor's is shared by every descendant under it,
+    so one oversized label found here multiplies across a whole subtree
+    rather than costing one row.
+    """
+    parts = []
+    seen = set()
+    current = merged.get(item_id, {}).get("parent", "")
+    while current and current != "root" and current not in seen and len(parts) < MENU_BREADCRUMB_DEPTH:
+        seen.add(current)
+        entry = merged.get(current)
+        if not entry:
+            break
+        label = entry.get("label")
+        if isinstance(label, str) and label:
+            parts.append(clamp_text(label, MENU_BREADCRUMB_LABEL_CHARS))
+        current = entry.get("parent", "")
+    parts.reverse()
+    return " › ".join(parts)
+
+
+def _menu_dollar_home(action, i):
+    """True when action[i] starts a word-bounded `$HOME` - the only
+    variable this module ever expands."""
+    if action[i:i + 5] != "$HOME":
+        return False
+    nxt = action[i + 5:i + 6]
+    return not (nxt.isalnum() or nxt == "_")
+
+
+def _menu_dollar_is_literal(action, i):
+    """True when the '$' at action[i] cannot start a real Bash expansion -
+    nothing follows it that could ever begin one - so it is just a literal
+    dollar sign, exactly as real Bash would treat it, quoted or not."""
+    nxt = action[i + 1:i + 2]
+    return not nxt or nxt not in MENU_DOLLAR_EXPANSION_CHARS
+
+
+def _menu_tokenize(action):
+    """A minimal, quote-aware tokeniser standing in for a real shell lexer.
+
+    Found by review across two rounds: neither a regex run over the raw
+    action string before tokenising, nor a per-token check run on shlex's
+    output afterwards, can correctly tell quoted (literal) text apart from
+    unquoted (meaningful) text - shlex.split discards quote type once it
+    hands back plain strings, and Bash's own quote-concatenation rule
+    (`'$'HOME` is one token made of a literal `$` plus unquoted `HOME`,
+    with no expansion) lets a single quoted character disguise the rest of
+    a token as unquoted to any check working from the outside in. This
+    walks the string exactly once, tracking real quote state per character,
+    so every substitution and rejection decision is made with that context
+    instead of a guess: $HOME expands inside double quotes and unquoted
+    text (real Bash's own rule), never inside single quotes; ~ expands only
+    at the true start of an unquoted word; and shell metacharacters/
+    keywords are rejected only where they appear outside of any quoting,
+    since that is the only place a real shell would ever treat them as
+    syntax rather than as literal text.
+
+    Returns a list of argv tokens with $HOME/~ already resolved, or None if
+    the action needs real shell semantics this does not implement.
+    """
+    home = os.environ.get("HOME", "")
+    tokens = []
+    chars = []
+    token_quoted = False
+    at_token_start = True
+    quote = None
+    i, n = 0, len(action)
+    while i < n:
+        c = action[i]
+        if quote == "'":
+            if c == "'":
+                quote = None
+            else:
+                chars.append(c)
+            i += 1
+            continue
+        if quote == '"':
+            if c == '"':
+                quote = None
+                i += 1
+                continue
+            if c == "$":
+                if _menu_dollar_home(action, i):
+                    chars.append(home)
+                    i += 5
+                    continue
+                if _menu_dollar_is_literal(action, i):
+                    chars.append("$")
+                    i += 1
+                    continue
+                return None
+            if c in ("`", "\\"):
+                return None
+            chars.append(c)
+            i += 1
+            continue
+        # unquoted - the reject-char check runs before the word-separator
+        # check, not after: \n is a real command separator in Bash, not a
+        # word separator, and found by review, checking it as a separator
+        # first let it fall through before the reject check ever ran,
+        # silently turning a two-command action into one command whose
+        # second line became a useless argv token instead of being rejected
+        # - byte-for-byte the same failure that reproved the very first
+        # round of this feature.
+        if c in MENU_UNQUOTED_REJECT_CHARS:
+            return None
+        if c in MENU_WORD_SEP:
+            if chars or token_quoted:
+                tokens.append(("".join(chars), token_quoted))
+                chars = []
+                token_quoted = False
+            at_token_start = True
+            i += 1
+            continue
+        if c == "'":
+            quote = "'"
+            token_quoted = True
+            at_token_start = False
+            i += 1
+            continue
+        if c == '"':
+            quote = '"'
+            token_quoted = True
+            at_token_start = False
+            i += 1
+            continue
+        if c == "~":
+            if at_token_start:
+                # Only the two forms this module actually implements: `~`
+                # alone (the whole word) or a `~/...` path. `~user`
+                # (another user's home), `~+` ($PWD) and `~-` ($OLDPWD) are
+                # real Bash tilde forms too - found by review, expanding any
+                # leading ~ unconditionally fabricated a path for these
+                # instead (`~+` became literally "$HOME+"). Reject rather
+                # than guess, the same policy already applied to every other
+                # unsupported construct in this function.
+                nxt = action[i + 1:i + 2]
+                if nxt == "" or nxt in MENU_WORD_SEP or nxt == "/":
+                    chars.append(home)
+                    at_token_start = False
+                    i += 1
+                    continue
+                return None
+            # Bash also expands a tilde after the `=` (and `:`) of some
+            # assignment-shaped words: `x=~/a` becomes `x=$HOME/a`. This
+            # lexer does not track the full assignment grammar, so keeping
+            # such a tilde literal can silently change an argument. Reject
+            # every non-leading unquoted tilde rather than guessing whether
+            # Bash would expand it; quoted tildes remain ordinary literals.
+            return None
+        if c == "$":
+            # $'...' (ANSI-C quoting) and $"..." (locale quoting) are real
+            # Bash constructs this module does not implement - found by
+            # review, treating the $ as a literal dollar sign here (as it
+            # correctly is inside already-open double quotes, where a `'`
+            # has no special meaning) accepted the action with the wrong
+            # argument instead of rejecting the construct: `$'abc'` means
+            # the single argument "abc" in Bash, not a literal "$" followed
+            # by a separately-quoted "abc".
+            if action[i + 1:i + 2] in ("'", '"'):
+                return None
+            if _menu_dollar_home(action, i):
+                chars.append(home)
+                at_token_start = False
+                i += 5
+                continue
+            if _menu_dollar_is_literal(action, i):
+                chars.append("$")
+                at_token_start = False
+                i += 1
+                continue
+            return None
+        chars.append(c)
+        at_token_start = False
+        i += 1
+    if quote is not None:
+        return None  # unterminated quote
+    if chars or token_quoted:
+        tokens.append(("".join(chars), token_quoted))
+    resolved = []
+    for text, quoted in tokens:
+        if not quoted and text in MENU_SHELL_KEYWORDS:
+            return None
+        resolved.append(text)
+    return resolved
+
+
+def _menu_resolve_argv(action):
+    """A config-supplied command line -> an argv vector, or None if it
+    can't be one without a real shell. Never returns something that was
+    not built by _menu_tokenize - no string is ever handed to a shell
+    here.
+    """
+    action = str(action or "").strip()
+    if not action:
+        return None
+    argv = _menu_tokenize(action)
+    if not argv or len(argv) > MENU_ARGV_TOKENS:
+        return None
+    for token in argv:
+        if len(token) > MENU_ARGV_CHARS:
+            return None
+    if not argv[0].startswith(MENU_ACTION_PREFIX):
+        return None
+    return argv
+
+
+_INSTALLED_PACKAGES = "unread"
+
+
+def _menu_installed_packages():
+    """`pacman -Qq` once per process, cached - answers every `omarchy-pkg-
+    present` check in `when` without a subprocess per entry.
+
+    Returns None, not a partial set, if the listing was truncated: a package
+    past the cut would silently read as "not installed" (or "installed", if
+    the condition is negated) with no error and no visible sign the answer
+    is wrong - exactly the false-negative-hides-a-feature failure the rest
+    of this module is written to avoid. 25x headroom on this machine today
+    (~21 KB against a 512 KB cap), but the check costs nothing to keep.
+    """
+    global _INSTALLED_PACKAGES
+    if _INSTALLED_PACKAGES != "unread":
+        return _INSTALLED_PACKAGES
+    raw, truncated = run_bounded(["pacman", "-Qq"], MENU_PKG_LIST_BYTES, MENU_PKG_LIST_DEADLINE)
+    _INSTALLED_PACKAGES = None if truncated else frozenset(raw.decode("utf-8", "replace").split())
+    return _INSTALLED_PACKAGES
+
+
+def _menu_when_allows(when):
+    """Only a handful of declarative `when` shapes are answered here - a
+    package or command present, a path existing - each resolved without a
+    shell (a package-name lookup, a PATH search, a stat). Every other shape
+    (hardware probes, `compgen`, arbitrary shell) is left showing rather
+    than hidden: a row nobody's hardware can use is a dead click, a row that
+    silently disappeared is a feature the user cannot find and cannot know
+    why - worse in a launcher.
+    """
+    when = str(when or "").strip()
+    if not when:
+        return True
+
+    m = MENU_WHEN_PKG_RE.match(when)
+    if m:
+        installed = _menu_installed_packages()
+        if installed is None:
+            return True  # truncated listing: unknown, not "not installed"
+        present = m.group(2) in installed
+        return (not present) if m.group(1) else present
+
+    m = MENU_WHEN_CMD_RE.match(when)
+    if m:
+        present = shutil.which(m.group(2)) is not None
+        return (not present) if m.group(1) else present
+
+    m = MENU_WHEN_PATH_RE.match(when)
+    if m:
+        negate, kind, quote_char = m.group(1), m.group(2), m.group(3)
+        path = m.group(4) if quote_char else m.group(5)
+        home = os.environ.get("HOME", "")
+        # $HOME expands inside double quotes and unquoted text, never
+        # inside single quotes; ~ never expands under any quoting, only
+        # unquoted - found by review, the previous version expanded both
+        # regardless of which quote (if any) wrapped the path, so
+        # `[[ ! -d '$HOME' ]]` (meant literally) silently tested the real
+        # home directory instead of the string "$HOME".
+        if quote_char != "'":
+            if home:
+                path = MENU_HOME_VAR_RE.sub(home, path)
+            if quote_char is None and (path == "~" or path.startswith("~/")):
+                path = home + path[1:]
+        exists = os.path.isdir(path) if kind == "d" else os.path.isfile(path)
+        return (not exists) if negate else exists
+
+    return True
+
+
+def _menu_commands():
+    """The real Omarchy root-menu tree, projected into the same row shape
+    Commands.js already emits - Spotlight.qml's dispatch does not need to
+    know these came from a different source. install.*/remove.* (package
+    management, not what a launcher's fuzzy search is for, and the single
+    largest source of `when` conditions) and system.* (already curated by
+    hand in Commands.js, confirmation prompts included) are excluded by
+    subtree; MENU_SKIP_IDS excludes specific known collisions with that same
+    curated catalogue; a `provider` entry pulls its rows from a runtime
+    function/command rather than static data and is excluded rather than
+    guessed at; an `action` this cannot turn into a plain argv vector is
+    excluded rather than run through a shell.
+    """
+    default_items = _menu_parse_items(_menu_read_default())
+    user_items = _menu_parse_items(_menu_read_user())
+    merged, order = _menu_merge(default_items, user_items)
+
+    rows = []
+    json_chars = 0
+    for item_id in order:
+        if len(rows) >= MENU_MAX_ITEMS:
+            break
+        if item_id.startswith(MENU_SKIP_PREFIXES) or item_id in ("install", "remove", "system"):
+            continue
+        if item_id in MENU_SKIP_IDS:
+            continue
+        entry = merged[item_id]
+        # kind, not a bare truthy `action` check: both are set together by
+        # the same source's normalization, so this is the field the merge
+        # above actually promises is in sync with the rest of the entry.
+        if entry.get("kind") != "action":
+            continue
+        if entry.get("provider"):
+            continue
+        argv = _menu_resolve_argv(entry.get("action"))
+        if not argv:
+            continue
+        if not _menu_when_allows(entry.get("when")):
+            continue
+        label = clamp_text(entry.get("label") or item_id, MENU_LABEL_CHARS)
+        if not label:
+            continue
+        aliases = entry.get("aliases")
+        keywords = " ".join(a for a in aliases if isinstance(a, str)) if isinstance(aliases, list) else ""
+        row = {
+            "key": "menu:" + item_id,
+            "title": _menu_title(label, argv),
+            "subtitle": _menu_breadcrumb(item_id, merged),
+            "icon": clamp_text(entry.get("icon") or "", 8),
+            "argv": argv,
+            "keywords": clamp_text(keywords, MENU_LABEL_CHARS),
+        }
+        # Real serialized size, not a row count, is what actually has to
+        # stay under Spotlight.qml's maxHelperPayloadChars - see
+        # MENU_JSON_BUDGET_CHARS. A single very long ancestor label was
+        # enough to build an oversized reply well under MENU_MAX_ITEMS.
+        row_chars = len(json.dumps(row, ensure_ascii=False, separators=(",", ":")))
+        if rows and json_chars + row_chars > MENU_JSON_BUDGET_CHARS:
+            break
+        json_chars += row_chars
+        rows.append(row)
+    return rows
+
+
+# ---------------------------------------------------------------- commands
+def ai_catalogs():
+    """Project the installed CLIs' local model catalogs into bounded picker data."""
+    catalogs = {"claude": [], "codex": []}
+    try:
+        fd = walk([".codex"])
+        try:
+            cache = read_json(fd, "models_cache.json", 1024 * 1024, {})
+        finally:
+            os.close(fd)
+        models = cache.get("models", []) if isinstance(cache, dict) else []
+        for item in models[:50]:
+            if not isinstance(item, dict) or item.get("visibility") != "list":
+                continue
+            levels = item.get("supported_reasoning_levels", [])
+            catalogs["codex"].append((item.get("slug"), item.get("display_name"),
+                                       [level.get("effort") for level in levels if isinstance(level, dict)]))
+    except (OSError, Denied, TypeError, AttributeError):
+        pass
+    try:
+        fd = walk([".claude", "cache", "model-catalog"])
+        try:
+            names = [name for name in os.listdir(fd) if name.endswith(".json")][:32]
+            newest = max(names, key=lambda name: os.stat(name, dir_fd=fd, follow_symlinks=False).st_mtime)
+            cache = read_json(fd, newest, 256 * 1024, {})
+        finally:
+            os.close(fd)
+        models = cache.get("catalog", {}).get("config", {}).get("models", [])
+        for item in models[:50]:
+            if not isinstance(item, dict):
+                continue
+            thinking = item.get("thinking") or {}
+            levels = thinking.get("effort_options", []) if isinstance(thinking, dict) else []
+            catalogs["claude"].append((item.get("id"), item.get("name"),
+                                        [level.get("id") for level in levels if isinstance(level, dict)]))
+    except (OSError, Denied, TypeError, AttributeError, ValueError):
+        pass
+    for provider, entries in catalogs.items():
+        catalogs[provider] = [
+            {"id": model, "name": name[:80], "efforts": [e for e in efforts if e in AI_EFFORTS]}
+            for model, name, efforts in entries[:30]
+            if isinstance(model, str) and AI_MODEL_RE.fullmatch(model) and isinstance(name, str)
+        ]
+    return catalogs
+
+
+def cmd_read_settings():
+    try:
+        fd = walk([".config", "omarchy"])
+    except FileNotFoundError:
+        emit({"settings": normalize_settings({}), "aiModels": ai_catalogs()})
+        return
+    try:
+        raw = read_file(fd, "spotlight.json", SETTINGS_BYTES)
+    finally:
+        os.close(fd)
+    try:
+        parsed = json.loads(raw.decode("utf-8", "replace")) if raw else {}
+    except ValueError:
+        parsed = None
+    # A hand edit that no longer parses is not a first run: no tour, no
+    # shortcut claimed. write-settings refuses to touch it as well.
+    if not isinstance(parsed, dict):
+        parsed = {"setupCompleted": True}
+    emit({"settings": normalize_settings(parsed), "aiModels": ai_catalogs()})
+
+
+def cmd_ensure_settings():
+    settings = normalize_settings({})
+    payload = (json.dumps(settings, indent=2) + "\n").encode("utf-8")
+    fd = walk([".config", "omarchy"], create=True)
+    try:
+        write_new(fd, "spotlight.json", payload)
+    finally:
+        os.close(fd)
+    emit({"path": os.path.join(os.environ["HOME"], ".config", "omarchy", "spotlight.json")})
+
+
+def cmd_ensure_data():
+    fd = walk([".local", "state", "omarchy"], create=True)
+    os.close(fd)
+    emit({"path": os.path.join(os.environ["HOME"], ".local", "state", "omarchy")})
+
+
+def cmd_reset_usage():
+    try:
+        fd = walk([".local", "state", "omarchy"])
+    except FileNotFoundError:
+        emit({"reset": True})
+        return
+    try:
+        if read_file(fd, "spotlight-usage.json", USAGE_BYTES) is not None:
+            os.unlink("spotlight-usage.json", dir_fd=fd)
+            os.fsync(fd)
+    finally:
+        os.close(fd)
+    emit({"reset": True})
+
+
+def cmd_read_hides():
+    """The desktop ids Omarchy keeps out of its own launcher.
+
+    Omarchy's AppLibrary filters these before it hands a list to the menu.
+    When the shell withholds that library, Spotlight builds the list itself
+    and has to apply the same filter, or it shows a page of entries the menu
+    has always hidden.
+    """
+    base = os.environ.get("OMARCHY_PATH", "").strip() or OMARCHY_FALLBACK_PATH
+    fd = system_dir(base.rstrip("/") + "/" + "/".join(HIDES_PARTS))
+    try:
+        raw = read_file(fd, HIDES_NAME, HIDES_BYTES, SYSTEM_OWNERS)
+    finally:
+        os.close(fd)
+
+    hides = []
+    for line in (raw or b"").decode("utf-8", "replace").splitlines():
+        value = line.strip()
+        if value.endswith(".desktop"):
+            value = value[:-8]
+        if HIDES_ID_RE.match(value):
+            hides.append(value)
+        if len(hides) >= HIDES_COUNT:
+            break
+    emit({"hides": hides})
+
+
+def cmd_read_menu_commands():
+    emit({"commands": _menu_commands()})
+
+
+def cmd_read_plugins():
+    raw, _ = view_output(["omarchy-shell", "shell", "listPlugins"],
+                         PLUGINS_BYTES, PLUGINS_DEADLINE, "plugin list unavailable")
+    try:
+        plugins = json.loads(raw)
+    except ValueError:
+        raise Denied("invalid plugin list")
+    if not isinstance(plugins, list):
+        raise Denied("invalid plugin list")
+    rows = []
+    seen = set()
+    panel_config = None
+    for plugin in plugins:
+        if not isinstance(plugin, dict):
+            continue
+        plugin_id = plugin.get("id")
+        kinds = plugin.get("kinds")
+        if not isinstance(plugin_id, str) or not PLUGIN_ID_RE.fullmatch(plugin_id) \
+                or plugin_id in seen or not isinstance(kinds, list):
+            continue
+        # listPlugins cannot distinguish a panel widget from a display-only one.
+        # Add bar-widget-only plugins when the host exposes an openability flag.
+        if not any(kind in kinds for kind in ("panel", "overlay", "menu")):
+            continue
+        enabled = plugin.get("enabled") is True
+        if "bar-widget" in kinds and "bar" not in kinds:
+            # For hybrids, listPlugins.enabled means inBar(), not isEnabled().
+            if panel_config is None:
+                raw, _ = view_output(["omarchy-shell", "shell", "listShellConfig"],
+                                     PLUGINS_BYTES, PLUGINS_DEADLINE,
+                                     "panel configuration unavailable")
+                try:
+                    panel_config = json.loads(raw)
+                except ValueError:
+                    raise Denied("invalid panel configuration")
+                if not isinstance(panel_config, dict):
+                    raise Denied("invalid panel configuration")
+            entries = panel_config.get("plugins", [])
+            entries = entries if isinstance(entries, list) else []
+            disabled = panel_config.get("disabledPlugins", [])
+            disabled = disabled if isinstance(disabled, list) else []
+            bar = panel_config.get("bar", {})
+            bar = bar if isinstance(bar, dict) else {}
+            enabled = plugin_id not in disabled and (
+                plugin.get("firstParty") is True or enabled or bar.get("id") == plugin_id
+                or any(isinstance(entry, dict) and entry.get("id") == plugin_id
+                       for entry in entries))
+        if not enabled:
+            continue
+        name = plugin.get("name")
+        if not isinstance(name, str):
+            name = plugin_id
+        name = " ".join("".join(
+            " " if unicodedata.category(ch) in ("Cc", "Cf") else ch
+            for ch in name[:PLUGIN_NAME_CHARS]).split()) or plugin_id
+        rows.append({"id": plugin_id, "name": name})
+        seen.add(plugin_id)
+        if len(rows) >= PLUGINS_COUNT:
+            break
+    emit({"plugins": rows})
+
+
+def cmd_summon_plugin(argv):
+    if len(argv) != 1 or not PLUGIN_ID_RE.fullmatch(argv[0]):
+        raise Denied("invalid plugin id")
+    raw, _ = view_output(["omarchy-shell", "shell", "summon", argv[0], "{}"],
+                         4096, PLUGINS_DEADLINE, "plugin launch unavailable")
+    if raw.strip() != b"ok":
+        raise Denied("plugin could not be opened")
+    emit({"opened": True})
+
+
+def cmd_read_usage():
+    fd = walk([".local", "state", "omarchy"], create=True)
+    try:
+        raw = read_file(fd, "spotlight-usage.json", USAGE_BYTES)
+        try:
+            parsed = json.loads(raw.decode("utf-8", "replace")) if raw is not None else {}
+        except ValueError:
+            parsed = {}
+        usage = normalize_usage(parsed)
+        if raw is not None and parsed != usage:
+            lock = lock_at(fd, ".spotlight-usage.lock")
+            try:
+                write_atomic(fd, "spotlight-usage.json",
+                             json.dumps(usage, separators=(",", ":")).encode("utf-8"))
+            finally:
+                os.close(lock)
+    finally:
+        os.close(fd)
+    emit({"usage": usage})
+
+
+def cmd_write_usage():
+    raw = read_stdin(USAGE_BYTES)
+    try:
+        parsed = json.loads(raw.decode("utf-8", "replace")) if raw else {}
+    except ValueError:
+        raise Denied("usage payload is not JSON")
+    usage = normalize_usage(parsed)
+    payload = json.dumps(usage, separators=(",", ":")).encode("utf-8")
+
+    fd = walk([".local", "state", "omarchy"], create=True)
+    try:
+        lock = lock_at(fd, ".spotlight-usage.lock")
+        try:
+            write_atomic(fd, "spotlight-usage.json", payload)
+        finally:
+            os.close(lock)
+    finally:
+        os.close(fd)
+    emit({"written": len(usage["items"])})
+
+
+def _clipboard_entries():
+    try:
+        fd = walk([".local", "state", "omarchy"])
+    except FileNotFoundError:
+        return []
+    try:
+        parsed = read_json(fd, "clipboard-history.json", CLIPBOARD_BYTES, [])
+    finally:
+        os.close(fd)
+    if not isinstance(parsed, list):
+        return []
+    out = []
+    for item in parsed:
+        if len(out) >= CLIP_ENTRIES:
+            break
+        if not isinstance(item, dict) or item.get("type") != "text":
+            continue
+        text = item.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        out.append(text)
+    return out
+
+
+def cmd_read_clipboard():
+    """Titles only.
+
+    The full clipboard text is deliberately left on disk: a history holding
+    tokens and passwords has no business being resident in a shell process
+    that outlives the query. `clipboard-copy` re-reads the one entry the user
+    picked and pipes it straight to wl-copy, so it never crosses this boundary.
+    """
+    entries = _clipboard_entries()
+    rows = []
+    for index, text in enumerate(entries):
+        flat = re.sub(r"\s+", " ", text).strip()
+        if not flat:
+            continue
+        title = flat[:CLIP_TITLE_CHARS] + ("…" if len(flat) > CLIP_TITLE_CHARS else "")
+        rows.append({"index": index, "title": title, "bytes": len(text.encode("utf-8"))})
+    emit({"items": rows})
+
+
+def cmd_clipboard_copy(argv):
+    if len(argv) != 2:
+        raise Denied("clipboard-copy takes an index and a title")
+    index = clamp_int(argv[0], 0, CLIP_ENTRIES - 1, -1)
+    if index < 0:
+        raise Denied("bad clipboard index")
+    entries = _clipboard_entries()
+    if index >= len(entries):
+        raise Denied("clipboard entry is gone")
+    text = entries[index]
+    # The history may have shifted between listing and activation, so the row
+    # the user actually saw is re-identified by its title before anything is
+    # put on the clipboard.
+    flat = re.sub(r"\s+", " ", text).strip()
+    expected = flat[:CLIP_TITLE_CHARS] + ("…" if len(flat) > CLIP_TITLE_CHARS else "")
+    if expected != argv[1]:
+        raise Denied("clipboard entry changed")
+    payload = text.encode("utf-8")[:CLIP_TEXT_BYTES]
+    # Not run_bounded: wl-copy forks a daemon that has to outlive this call in
+    # order to serve the selection, and tearing down the process group would
+    # take that daemon with it. A plain bounded wait on the parent is right
+    # here — the input is a fixed size and the argv has no operands at all.
+    try:
+        subprocess.run(["wl-copy"], input=payload, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise Denied("wl-copy failed: %s" % type(exc).__name__)
+    emit({"copied": len(payload)})
+
+
+def cmd_reminders():
+    raw, _ = run_bounded(["omarchy-reminder", "show", "--json"],
+                         REMINDER_BYTES, REMINDER_DEADLINE)
+    try:
+        parsed = json.loads(raw.decode("utf-8", "replace")) if raw else {}
+    except ValueError:
+        parsed = {}
+    items = parsed.get("reminders") if isinstance(parsed, dict) else None
+    rows = []
+    if isinstance(items, list):
+        for item in items[:REMINDER_COUNT]:
+            if not isinstance(item, dict):
+                continue
+            rows.append({
+                "label": clamp_text(item.get("label"), REMINDER_FIELD_CHARS),
+                "remaining": clamp_text(item.get("remaining"), REMINDER_FIELD_CHARS),
+                "atTime": clamp_text(item.get("atTime"), REMINDER_FIELD_CHARS),
+            })
+    emit({"reminders": rows})
+
+
+# ------------------------------------------------------------ toggle states
+# Omarchy keeps most toggles as a flag file, and most of those flags record the
+# *off* state (`bar-off`), so which way the file reads is part of the table.
+# state id -> (path relative to $HOME, does the file existing mean "on")
+TOGGLE_FLAGS = {
+    "idle":         (".local/state/omarchy/indicators/stay-awake", True),
+    "bar":          (".local/state/omarchy/toggles/bar-off", False),
+    "screensaver":  (".local/state/omarchy/toggles/screensaver-off", False),
+    "suspend":      (".local/state/omarchy/toggles/suspend-off", False),
+    "crashcapture": (".local/state/omarchy/toggles/crash-capture-off", False),
+    "touchpad":     (".local/state/omarchy/toggles/hypr/touchpad-disabled-name", False),
+    "touchscreen":  (".local/state/omarchy/toggles/hypr/touchscreen-disabled-name", False),
+    "gaps":         (".local/state/omarchy/toggles/hypr/window-no-gaps.lua", False),
+    "aspect":       (".local/state/omarchy/toggles/hypr/single-window-aspect-ratio.lua", True),
+}
+
+
+def _tri(text, on_token, off_token):
+    return {on_token: True, off_token: False}.get(text.strip().lower())
+
+
+def _probe_json(text, key):
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return None
+    return parsed.get(key) if isinstance(parsed, dict) else None
+
+
+def _probe_bluetooth(text):
+    # The soft block is the state Omarchy persists (see omarchy-bluetooth-power),
+    # so read the block rather than BlueZ: no D-Bus round trip, and it survives
+    # a reboot the same way the setting does.
+    for line in text.splitlines():
+        if line.startswith("bluetooth"):
+            return line.split()[-1] == "unblocked"
+    return None
+
+
+def _probe_nightlight(text):
+    value = _probe_json(text, "enabled")
+    return value if isinstance(value, bool) else None
+
+
+def _probe_mic(text):
+    # wpctl always prints "Volume: <n>", and appends "[MUTED]" when muted.
+    if "volume" not in text.lower():
+        return None
+    return "muted" not in text.lower()
+
+
+def _run_probe(argv, test):
+    raw, _ = run_bounded(argv, TOGGLE_BYTES, TOGGLE_DEADLINE)
+    return test(raw.decode("utf-8", "replace").strip())
+
+
+def _cmd_probe(argv, test):
+    return lambda: _run_probe(argv, test)
+
+
+def _probe_fullscreen(text):
+    # `fullscreenClient == 2` is the state omarchy-hyprland-window-tiled-
+    # fullscreen-toggle sets, and it is the focused window's, not the session's:
+    # Spotlight is a layer surface, so the window behind it stays the active one.
+    value = _probe_json(text, "fullscreenClient")
+    return value == 2 if isinstance(value, int) else None
+
+
+def _probe_scrolling(text):
+    # Dwindle and scrolling are the only two layouts the toggle cycles, so
+    # "scrolling is on" is the whole state rather than half of it.
+    value = _probe_json(text, "tiledLayout")
+    return _tri(value, "scrolling", "dwindle") if isinstance(value, str) else None
+
+
+def _probe_opaque(text):
+    # `opaque` is a per-window override, absent from the window's own JSON and
+    # readable only through getprop. Opaque on is transparency off.
+    value = _probe_json(text, "opaque")
+    return (not value) if isinstance(value, bool) else None
+
+
+def _probe_battery_percent():
+    """The bar writes this one into its own entry in shell.json, so the state
+    is the layout entry rather than a flag file or a command."""
+    # cmd_toggle_states turns a Denied or an OSError here into "unknown", which
+    # is the right answer for a home or a config this helper cannot read.
+    fd = walk([".config", "omarchy"])
+    try:
+        parsed = read_json(fd, "shell.json", SETTINGS_BYTES, None)
+    finally:
+        os.close(fd)
+    bar = parsed.get("bar") if isinstance(parsed, dict) else None
+    layout = bar.get("layout") if isinstance(bar, dict) else None
+    if not isinstance(layout, dict):
+        return None
+    for side in ("left", "center", "right"):
+        for entry in layout.get(side) or []:
+            if isinstance(entry, dict) and entry.get("id") == "omarchy.power":
+                return entry.get("showPercentage") is True
+    # No power module in the bar means nothing to show the percentage on.
+    return None
+
+
+def _probe_speaker():
+    """The sink has to be resolved first: DSP sinks mean @DEFAULT_SINK@ is not
+    always the device omarchy-audio-output-volume actually mutes."""
+    sink, _ = run_bounded(["omarchy-audio-output-sink"], TOGGLE_BYTES, TOGGLE_DEADLINE)
+    sink = sink.decode("utf-8", "replace").strip()
+    if not sink:
+        return None
+    return _run_probe(["pactl", "get-sink-mute", sink],
+                      lambda t: _tri(t, "mute: no", "mute: yes"))
+
+
+# state id -> a probe that answers True, False, or None for "cannot tell"
+TOGGLE_PROBES = {
+    "bluetooth":  _cmd_probe(["rfkill", "--noheadings", "--output", "TYPE,SOFT"], _probe_bluetooth),
+    "wifi":       _cmd_probe(["nmcli", "radio", "wifi"], lambda t: _tri(t, "enabled", "disabled")),
+    "nightlight": _cmd_probe(["omarchy-toggle-nightlight", "--status"], _probe_nightlight),
+    "dnd":        _cmd_probe(["omarchy-shell", "notifications", "dndState"], lambda t: _tri(t, "on", "off")),
+    "mic":        _cmd_probe(["wpctl", "get-volume", "@DEFAULT_AUDIO_SOURCE@"], _probe_mic),
+    "speaker":    _probe_speaker,
+    "fullscreen": _cmd_probe(["hyprctl", "activewindow", "-j"], _probe_fullscreen),
+    "scrolling":  _cmd_probe(["hyprctl", "activeworkspace", "-j"], _probe_scrolling),
+    "batterypercent": _probe_battery_percent,
+    "transparency": _cmd_probe(
+        ["hyprctl", "-j", "getprop", "activewindow", "opaque"], _probe_opaque),
+}
+
+
+def cmd_toggle_states():
+    home = os.environ.get("HOME", "")
+    states = {}
+    if home.startswith("/"):
+        for name, (rel, present_is_on) in TOGGLE_FLAGS.items():
+            states[name] = os.path.exists(os.path.join(home, rel)) == present_is_on
+
+    # ponytail: probes run one after another, ~300ms worst case off the UI
+    # thread; parallelise with Popen if open latency ever shows it.
+    for name, probe in TOGGLE_PROBES.items():
+        try:
+            value = probe()
+        except (Denied, OSError, ValueError):
+            value = None
+        if value is not None:
+            states[name] = bool(value)
+    emit({"states": states})
+
+
+def fetch_json(url, cap, deadline):
+    """Fetch bounded JSON without following redirects."""
+    from http.client import HTTPException
+    from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+    class NoRedirect(HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    request = Request(url, headers={"Accept": "application/json", "User-Agent": "Spotlight"})
+    try:
+        with build_opener(NoRedirect).open(request, timeout=deadline) as response:
+            raw = response.read(cap + 1)
+            charset = response.headers.get_content_charset()
+            if not isinstance(charset, str) or not charset:
+                charset = "utf-8"
+    except HTTPException as exc:
+        raise OSError("incomplete HTTP response") from exc
+    if len(raw) > cap:
+        raise Denied("network response too large")
+    try:
+        return json.loads(raw.decode(charset))
+    except LookupError as exc:
+        raise ValueError("unknown response charset") from exc
+
+
+def cmd_suggest(argv):
+    if len(argv) not in (1, 2):
+        raise Denied("suggest takes a query and an optional engine")
+    engine = argv[1] if len(argv) == 2 else "g"
+    if not re.fullmatch(r"[a-z]{1,8}", engine):
+        raise Denied("suggest engine must be a bang key")
+    query = clamp_text(argv[0], SUGGEST_QUERY_CHARS).strip()
+    if not query:
+        emit({"suggestions": []})
+        return
+    # The endpoint is built here rather than passed in, so nothing upstream can
+    # steer the request at a different host. urllib keeps this feature inside
+    # Python's standard library; a stock install does not need curl.
+    from urllib.parse import quote
+
+    endpoint = ("https://kagi.com/api/autosuggest?q=" if engine == "kagi" else
+                "https://suggestqueries.google.com/complete/search?client=firefox&hl=en&q=")
+    url = endpoint + quote(query, safe="")
+    try:
+        parsed = fetch_json(url, SUGGEST_BYTES, SUGGEST_DEADLINE)
+    except (OSError, ValueError, Denied, RecursionError):
+        parsed = []
+    items = parsed[1] if isinstance(parsed, list) and len(parsed) > 1 else []
+    out = []
+    if isinstance(items, list):
+        for item in items[:SUGGEST_COUNT * 4]:
+            if len(out) >= SUGGEST_COUNT:
+                break
+            if not isinstance(item, str):
+                continue
+            s = clamp_text(item, SUGGEST_CHARS).strip()
+            if s:
+                out.append(s)
+    emit({"suggestions": out})
+
+
+def currency_record(value, now, base=None, quote=None):
+    """Project a cache/API record, rejecting invalid dates, rates and pairs."""
+    if not isinstance(value, dict):
+        return None
+    for field, expected in (("base", base), ("quote", quote)):
+        code = value.get(field)
+        if not isinstance(code, str) or not CURRENCY_CODE_RE.fullmatch(code):
+            return None
+        if expected is not None and code != expected:
+            return None
+    rate, fetched = value.get("rate"), value.get("fetchedAt")
+    try:
+        if (type(rate) not in (int, float) or not math.isfinite(rate) or rate <= 0
+                or type(fetched) not in (int, float) or not math.isfinite(fetched)
+                or not 0 < fetched <= now):
+            return None
+        day = value.get("date")
+        if not isinstance(day, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+            return None
+        if date.fromisoformat(day) > datetime.fromtimestamp(now, timezone.utc).date():
+            return None
+    except (ValueError, OverflowError, OSError):
+        return None
+    return {"base": value["base"], "quote": value["quote"], "rate": rate,
+            "date": day, "fetchedAt": fetched}
+
+
+def _currency_cache_dir(create=False):
+    return walk([".cache", "omarchy"], create=create)
+
+
+def _currency_cache_read(fd, now):
+    # Boundary violations propagate so a planted file is never replaced.
+    payload = read_json(fd, CURRENCY_CACHE_NAME, CURRENCY_CACHE_BYTES, {})
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        return {}
+    records = payload.get("rates")
+    if not isinstance(records, list) or len(records) > CURRENCY_CACHE_KEEP:
+        return {}
+    out = {}
+    for value in records:
+        record = currency_record(value, now)
+        if record:
+            key = record["base"] + "/" + record["quote"]
+            if key not in out or record["fetchedAt"] > out[key]["fetchedAt"]:
+                out[key] = record
+    return out
+
+
+def currency_cached(base, quote, now):
+    try:
+        fd = _currency_cache_dir()
+        try:
+            return _currency_cache_read(fd, now).get(base + "/" + quote)
+        finally:
+            os.close(fd)
+    except (OSError, Denied, ValueError, RecursionError):
+        return None
+
+
+def currency_store(record):
+    """Merge under a nonblocking lock; persistence must never delay an answer."""
+    fd = lock = None
+    try:
+        fd = _currency_cache_dir(create=True)
+        lock = lock_at(fd, "spotlight-currency.lock", blocking=False)
+        records = _currency_cache_read(fd, time.time())
+        key = record["base"] + "/" + record["quote"]
+        if key not in records or record["fetchedAt"] >= records[key]["fetchedAt"]:
+            records[key] = record
+        rates = sorted(records.values(), key=lambda r: r["fetchedAt"], reverse=True)
+        rates = rates[:CURRENCY_CACHE_KEEP]
+        payload = json.dumps({"version": 1, "rates": rates}, allow_nan=False).encode("utf-8")
+        if len(payload) <= CURRENCY_CACHE_BYTES:
+            write_atomic(fd, CURRENCY_CACHE_NAME, payload)
+    except (OSError, Denied, ValueError, RecursionError):
+        pass
+    finally:
+        if lock is not None:
+            os.close(lock)
+        if fd is not None:
+            os.close(fd)
+
+
+def currency_fetch(base, quote):
+    def expired(_signum, _frame):
+        raise TimeoutError("currency lookup deadline exceeded")
+
+    # Socket timeouts alone restart between reads. This deadline also bounds
+    # connect, TLS and a server that trickles bytes. libc DNS resolution may
+    # still run until the resolver's own timeout before Python handles SIGALRM.
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, CURRENCY_DEADLINE)
+    try:
+        url = "https://api.frankfurter.dev/v2/rate/" + base.lower() + "/" + quote.lower()
+        value = fetch_json(url, CURRENCY_BYTES, CURRENCY_DEADLINE)
+        now = time.time()
+        if isinstance(value, dict):
+            value["fetchedAt"] = now
+        record = currency_record(value, now, base, quote)
+        if record is None:
+            raise Denied("invalid currency response")
+        return record
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def cmd_currency_rate(argv):
+    cached_only = len(argv) == 3 and argv[0] == "--cached-only"
+    pair = argv[1:] if cached_only else argv
+    if len(pair) != 2 or any(not CURRENCY_CODE_RE.fullmatch(v) for v in pair):
+        raise Denied("currency-rate takes two uppercase currency codes")
+    base, quote = pair
+    now = time.time()
+    if base == quote:
+        emit({"base": base, "quote": quote, "rate": 1,
+              "date": datetime.fromtimestamp(now, timezone.utc).date().isoformat(),
+              "fetchedAt": now, "stale": False})
+        return
+    cached = currency_cached(base, quote, now)
+    if cached and now - cached["fetchedAt"] < CURRENCY_TTL:
+        emit(dict(cached, stale=False))
+        return
+    if cached_only:
+        if cached:
+            emit(dict(cached, stale=True))
+        else:
+            raise Denied("currency rate unavailable")
+        return
+    try:
+        record = currency_fetch(base, quote)
+    except (OSError, ValueError, Denied, RecursionError):
+        if cached:
+            emit(dict(cached, stale=True))
+        else:
+            raise Denied("currency rate unavailable") from None
+        return
+    currency_store(record)
+    emit(dict(record, stale=False))
+
+
+def currency_fetch_many(base, quotes):
+    def expired(_signum, _frame):
+        raise TimeoutError("currency lookup deadline exceeded")
+
+    # Same deadline as currency_fetch; one request answers the whole list.
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, CURRENCY_DEADLINE)
+    try:
+        url = ("https://api.frankfurter.dev/v2/rates?base=" + base
+               + "&quotes=" + ",".join(quotes))
+        value = fetch_json(url, CURRENCY_BYTES, CURRENCY_DEADLINE)
+        now = time.time()
+        if not isinstance(value, list):
+            raise Denied("invalid currency response")
+        records = {}
+        for item in value[:CURRENCY_PREVIEW_QUOTES]:
+            if isinstance(item, dict):
+                item["fetchedAt"] = now
+            record = currency_record(item, now, base)
+            if record and record["quote"] in quotes:
+                records[record["quote"]] = record
+        return records
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def cmd_currency_rates(argv):
+    """Rates from one base to a short list of quotes, for the preview pane.
+
+    Fresh cache entries are reused; everything else is fetched in a single
+    request and written back to the same cache `currency-rate` reads. A quote
+    the network cannot answer falls back to its stale cache entry, or is left
+    out of the reply.
+    """
+    cached_only = len(argv) == 3 and argv[0] == "--cached-only"
+    args = argv[1:] if cached_only else argv
+    if len(args) != 2 or not CURRENCY_CODE_RE.fullmatch(args[0]):
+        raise Denied("currency-rates takes a currency code and a comma-separated list")
+    base = args[0]
+    quotes = []
+    for code in args[1].split(","):
+        if not CURRENCY_CODE_RE.fullmatch(code):
+            raise Denied("currency-rates takes uppercase currency codes")
+        if code != base and code not in quotes:
+            quotes.append(code)
+    if not quotes or len(quotes) > CURRENCY_PREVIEW_QUOTES:
+        raise Denied("currency-rates takes 1 to %d quotes" % CURRENCY_PREVIEW_QUOTES)
+    now = time.time()
+    found, missing = {}, []
+    for quote in quotes:
+        cached = currency_cached(base, quote, now)
+        if cached and now - cached["fetchedAt"] < CURRENCY_TTL:
+            found[quote] = dict(cached, stale=False)
+        else:
+            missing.append(quote)
+            if cached:
+                found[quote] = dict(cached, stale=True)
+    if missing and not cached_only:
+        try:
+            fetched = currency_fetch_many(base, missing)
+        except (OSError, ValueError, Denied, RecursionError):
+            fetched = {}
+        for quote, record in fetched.items():
+            currency_store(record)
+            found[quote] = dict(record, stale=False)
+    emit({"base": base, "rates": [found[q] for q in quotes if q in found]})
+
+
+def cmd_files(argv):
+    if len(argv) != 2:
+        raise Denied("files takes a directory and a pattern")
+    directory = argv[0]
+    pattern = clamp_text(argv[1], FILES_PATTERN_CHARS)
+    if not directory.startswith("/") or len(directory) > FILES_PATH_CHARS or not pattern.strip():
+        raise Denied("bad file search target")
+    try:
+        probe = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError:
+        emit({"files": []})
+        return
+    os.close(probe)
+
+    # A query like "PMJ XLS" is two terms a user expects ANDed together (one
+    # for the name, one for the extension), not one literal substring — `fd`
+    # takes the first positional pattern plus any number of --and patterns,
+    # so the split lands directly on its own multi-pattern support (fd >= 9.0).
+    #
+    # --ignore-case overrides fd's own smart-case, under which a term typed
+    # in caps (an extension, an acronym) would otherwise force case-sensitive
+    # matching on that one term and silently drop real hits — "XLS" not
+    # matching ".xlsx" is what a user actually typing this feature hits.
+    # Spotlight, the target this plugin models itself on, is not case
+    # sensitive either.
+    terms = pattern.split()[:FILES_MAX_TERMS]
+    fd_argv = ["fd", "--hidden", "--follow", "--one-file-system", "--ignore-case",
+               "--exclude", ".git", "--exclude", "node_modules", "--exclude", ".cache",
+               "--max-results", str(FILES_COUNT)]
+    for term in terms[1:]:
+        fd_argv += ["--and", term]
+    fd_argv += ["--", terms[0], directory]
+
+    raw, truncated = run_bounded(fd_argv, FILES_BYTES, FILES_DEADLINE)
+
+    lines = raw.decode("utf-8", "replace").split("\n")
+    if truncated:
+        # run_bounded truncates two ways - the byte cap, or the deadline
+        # tearing the process group down mid-write - and either can land
+        # mid-path. Whether that clean-looking last line is really complete
+        # or was just cut on a lucky boundary is not knowable from here, so
+        # it is dropped rather than risk emitting a path that was never
+        # real - one fewer candidate costs nothing this deep in the pool.
+        lines = lines[:-1]
+
+    rows = []
+    json_chars = 0
+    for line in lines:
+        if len(rows) >= FILES_COUNT:
+            break
+        if not line or len(line) > FILES_PATH_CHARS:
+            continue
+        is_dir = line.endswith("/")
+        path = line[:-1] if is_dir else line
+        if not path:
+            continue
+        slash = path.rfind("/")
+        name = path[slash + 1:] if slash >= 0 else path
+        dirname = path[:slash] if slash > 0 else "/"
+        row = {"id": path_fingerprint(path), "path": path, "name": name,
+               "dir": dirname, "isDir": is_dir}
+        # The real serialized size, not an estimate from raw string lengths:
+        # a control character (legal in a Linux filename, not rejected
+        # above) expands to a 6-char \uXXXX escape in JSON regardless of
+        # ensure_ascii, which a flat "len(path) + overhead" guess does not
+        # see coming - confirmed able to blow past FILES_JSON_BUDGET_CHARS
+        # on an ASCII-length estimate alone.
+        row_chars = len(json.dumps(row, ensure_ascii=False, separators=(",", ":")))
+        if rows and json_chars + row_chars > FILES_JSON_BUDGET_CHARS:
+            break
+        json_chars += row_chars
+        rows.append(row)
+    emit({"files": rows})
+
+
+# ---------------------------------------------------------------- previews
+def _preview_time(seconds):
+    try:
+        return datetime.fromtimestamp(seconds).strftime("%Y-%m-%d %H:%M")
+    except (OverflowError, OSError, ValueError):
+        return ""
+
+
+def _preview_secret_path(path):
+    home = os.environ.get("HOME", "")
+    for base in {home, os.path.realpath(home)} if home else ():
+        for folder in PREVIEW_SECRET_DIRS:
+            root = os.path.join(base, folder)
+            if path == root or path.startswith(root + "/"):
+                return True
+    name = os.path.basename(path).lower()
+    return any(fnmatch.fnmatchcase(name, pattern) for pattern in PREVIEW_SECRET_NAMES) \
+        and not name.endswith(".pub")
+
+
+def _preview_secret(path):
+    """Files and folders whose contents are not put on screen just because the
+    cursor passed. File search follows symlinks, so a link is judged by both
+    its own name and what it points at."""
+    return _preview_secret_path(path) or _preview_secret_path(os.path.realpath(path))
+
+
+def cmd_preview_file(argv, browse=False):
+    """Metadata plus a bounded look inside one file or folder.
+
+    Only regular files are opened, and with O_NONBLOCK, so a FIFO or device
+    that matched a search can never stall the helper. Images are left for the
+    pane to decode at its own size; text is the first PREVIEW_TEXT_LINES lines
+    of the first PREVIEW_TEXT_BYTES bytes.
+    """
+    if len(argv) != 1:
+        raise Denied("preview-file takes one path")
+    path = argv[0]
+    if not path.startswith("/") or len(path) > FILES_PATH_CHARS or "\x00" in path:
+        raise Denied("bad preview path")
+    try:
+        info = os.stat(path)
+    except OSError:
+        raise Denied("file is gone") from None
+    mime = mimetypes.guess_type(path, strict=False)[0] or ""
+    out = {"modified": _preview_time(info.st_mtime), "size": info.st_size}
+    # Before anything that shows contents: a listing, an image or text.
+    if _preview_secret(path):
+        emit(dict(out, kind="hidden",
+                  description="Folder" if stat.S_ISDIR(info.st_mode) else mime or "Private file"))
+        return
+    if stat.S_ISDIR(info.st_mode):
+        # shortcut: browsing is capped by entry count and JSON size; add paging for full navigation.
+        entries, count = [], 0
+        try:
+            with os.scandir(path) as listing:
+                for entry in listing:
+                    count += 1
+                    if count > PREVIEW_DIR_COUNT:
+                        break
+                    try:
+                        is_dir = entry.is_dir()
+                    except OSError:
+                        is_dir = False
+                    entries.append({"name": clamp_text(entry.name, 200), "isDir": is_dir,
+                                    "path": entry.path})
+        except OSError:
+            raise Denied("folder cannot be read") from None
+        entries.sort(key=lambda e: (not e["isDir"], e["name"].lower()))
+        bounded, json_chars = [], 0
+        for entry in entries[:PREVIEW_DIR_COUNT if browse else PREVIEW_DIR_ENTRIES]:
+            json_chars += len(json.dumps(entry, ensure_ascii=False, separators=(",", ":"))) + 1
+            if json_chars > FILES_JSON_BUDGET_CHARS:
+                break
+            bounded.append(entry)
+        emit(dict(out, kind="dir", description="Folder", entries=bounded,
+                  count=min(count, PREVIEW_DIR_COUNT),
+                  more=count > PREVIEW_DIR_COUNT or (browse and len(bounded) < len(entries))))
+        return
+    if not stat.S_ISREG(info.st_mode):
+        emit(dict(out, kind="other", description="Special file"))
+        return
+    if mime.startswith("image/") and info.st_size <= PREVIEW_IMAGE_BYTES:
+        emit(dict(out, kind="image", description=mime))
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        try:
+            raw = os.read(fd, PREVIEW_TEXT_BYTES)
+        finally:
+            os.close(fd)
+    except OSError:
+        raise Denied("file cannot be read") from None
+    if b"\x00" in raw:
+        emit(dict(out, kind="binary", description=mime or "Binary file"))
+        return
+    text = raw.decode("utf-8", "replace")
+    if info.st_size > len(raw):
+        # The read may have cut a line, or a character, in half.
+        text = text.rpartition("\n")[0] or text
+    lines = text.split("\n")
+    shown = [clamp_text(line.replace("\t", "    "), PREVIEW_LINE_CHARS)
+             for line in lines[:PREVIEW_TEXT_LINES]]
+    emit(dict(out, kind="text", description=mime or "Text", text="\n".join(shown).rstrip("\n"),
+              lines=len(lines) - (1 if lines and lines[-1] == "" else 0),
+              truncated=info.st_size > len(raw) or len(lines) > PREVIEW_TEXT_LINES))
+
+
+def cmd_clipboard_preview(argv):
+    """One history entry, bounded, for the pane while its row is selected.
+
+    The same re-identification as clipboard-copy: the entry is looked up by
+    index and must still carry the title the user saw.
+    """
+    if len(argv) != 2:
+        raise Denied("clipboard-preview takes an index and a title")
+    index = clamp_int(argv[0], 0, CLIP_ENTRIES - 1, -1)
+    entries = _clipboard_entries()
+    if index < 0 or index >= len(entries):
+        raise Denied("clipboard entry is gone")
+    text = entries[index]
+    flat = re.sub(r"\s+", " ", text).strip()
+    if flat[:CLIP_TITLE_CHARS] + ("…" if len(flat) > CLIP_TITLE_CHARS else "") != argv[1]:
+        raise Denied("clipboard entry changed")
+    lines = text.split("\n")
+    excerpt = "\n".join(clamp_text(line, PREVIEW_LINE_CHARS) for line in lines[:PREVIEW_TEXT_LINES])
+    excerpt = excerpt[:PREVIEW_CLIP_CHARS]
+    emit({"text": excerpt, "chars": len(text), "lines": len(lines),
+          "truncated": len(excerpt) < len(text)})
+
+
+def _preview_process(pid):
+    if not re.fullmatch(r"[1-9][0-9]{0,9}", pid):
+        raise Denied("bad pid")
+    base = "/proc/" + pid
+    try:
+        with open(base + "/cmdline", "rb") as handle:
+            raw = handle.read(PREVIEW_CMDLINE_BYTES)
+        with open(base + "/stat", "rb") as handle:
+            record = handle.read(PREVIEW_CMDLINE_BYTES)
+        info = os.stat(base)
+    except OSError:
+        raise Denied("process is gone") from None
+    command = " ".join(part.decode("utf-8", "replace") for part in raw.split(b"\x00") if part)
+    try:
+        user = pwd.getpwuid(info.st_uid).pw_name
+    except KeyError:
+        user = str(info.st_uid)
+    return {"command": clamp_text(command, 400), "user": user, "started": _process_started(record)}
+
+
+def _process_started(record):
+    """Launch time from /proc/<pid>/stat: starttime (field 22) is in clock
+    ticks since boot. The directory's own timestamps say when the inode was
+    first looked up, not when the process began."""
+    # The command name (field 2) is parenthesised and may itself hold ") ".
+    fields = record.rpartition(b")")[2].split()
+    try:
+        ticks = int(fields[19])
+        with open("/proc/stat", "rb") as handle:
+            boot = next(int(line.split()[1]) for line in handle.read(PREVIEW_PROC_STAT_BYTES).splitlines()
+                        if line.startswith(b"btime "))
+        return _preview_time(boot + ticks / os.sysconf("SC_CLK_TCK"))
+    except (IndexError, ValueError, StopIteration, OSError):
+        return ""
+
+
+def _preview_ssh(host):
+    # ponytail: first matching Host blocks in ~/.ssh/config only; follow
+    # Include and Match the way cmd_ssh_hosts does when someone needs it.
+    if not SSH_ALIAS_RE.fullmatch(host):
+        raise Denied("bad host")
+    try:
+        fd = walk((".ssh",))
+        try:
+            raw = read_file(fd, "config", SSH_CONFIG_BYTES) or b""
+        finally:
+            os.close(fd)
+    except (FileNotFoundError, OSError, Denied):
+        raw = b""
+    wanted = {"hostname": "", "user": "", "port": "", "identityfile": "", "proxyjump": ""}
+    active = True
+    for line in raw.decode("utf-8", "replace").splitlines():
+        match = re.match(r"^\s*([A-Za-z]+)\s*(?:=\s*|\s+)(.*)$", line)
+        if not match:
+            continue
+        key = match.group(1).lower()
+        try:
+            values = shlex.split(match.group(2), comments=True)
+        except ValueError:
+            continue
+        if key == "host":
+            positive = [v for v in values if not v.startswith("!")]
+            negative = [v[1:] for v in values if v.startswith("!")]
+            active = any(fnmatch.fnmatchcase(host, p) for p in positive) \
+                and not any(fnmatch.fnmatchcase(host, p) for p in negative)
+        elif key == "match":
+            active = False
+        elif active and key in wanted and not wanted[key] and values:
+            wanted[key] = clamp_text(" ".join(values), 200)
+    return {"hostname": wanted["hostname"] or host, "user": wanted["user"],
+            "port": wanted["port"] or "22", "identity": wanted["identityfile"],
+            "proxyjump": wanted["proxyjump"]}
+
+
+def _preview_docker(container):
+    if not DOCKER_ID_RE.fullmatch(container):
+        raise Denied("bad container id")
+    raw, _ = view_output(["docker", "inspect", "--type", "container", "--", container],
+                         DOCKER_BYTES, DOCKER_DEADLINE, "Docker unavailable")
+    try:
+        parsed = json.loads(raw.decode("utf-8", "replace"))
+        item = parsed[0] if isinstance(parsed, list) and parsed else {}
+    except ValueError:
+        item = {}
+    state = item.get("State") if isinstance(item.get("State"), dict) else {}
+    config = item.get("Config") if isinstance(item.get("Config"), dict) else {}
+    ports = []
+    network = item.get("NetworkSettings") if isinstance(item.get("NetworkSettings"), dict) else {}
+    for inner, bindings in (network.get("Ports") or {}).items():
+        for binding in bindings or []:
+            if isinstance(binding, dict):
+                ports.append("%s:%s → %s" % (binding.get("HostIp", ""), binding.get("HostPort", ""), inner))
+    # The container's stderr arrives on docker's own stderr.
+    logs, _ = run_bounded(["docker", "logs", "--tail", str(PREVIEW_LOG_LINES), "--", container],
+                          PREVIEW_LOG_BYTES, DOCKER_DEADLINE, merge_stderr=True)
+    started = str(state.get("StartedAt") or "")
+    return {"image": clamp_text(config.get("Image"), 160),
+            "status": clamp_text(state.get("Status"), 32),
+            "started": clamp_text(started[:19].replace("T", " "), 32),
+            "ports": clamp_text(", ".join(ports[:6]), 300),
+            "logs": clamp_text(logs.decode("utf-8", "replace").strip(), PREVIEW_CLIP_CHARS)}
+
+
+def _preview_service(scope, name):
+    if scope not in ("user", "system") or not SERVICE_NAME_RE.fullmatch(name):
+        raise Denied("bad service")
+    raw, _ = view_output(["systemctl", "--" + scope, "show", "--no-pager",
+                          "--property=ActiveState,SubState,ActiveEnterTimestamp,MainPID,MemoryCurrent",
+                          "--", name], PREVIEW_LOG_BYTES, SERVICES_DEADLINE, "services unavailable")
+    props = {}
+    for line in raw.decode("utf-8", "replace").splitlines():
+        key, _, value = line.partition("=")
+        props[key] = value
+    memory = props.get("MemoryCurrent", "")
+    logs, _ = run_bounded(["journalctl", "--" + scope, "--unit=" + name, "--lines",
+                           str(PREVIEW_LOG_LINES), "--no-pager", "--output=short", "--quiet"],
+                          PREVIEW_LOG_BYTES, SERVICES_DEADLINE)
+    return {"state": clamp_text(props.get("ActiveState", "") + " (" + props.get("SubState", "") + ")", 64),
+            "since": clamp_text(props.get("ActiveEnterTimestamp", ""), 64),
+            "pid": props.get("MainPID", "") if props.get("MainPID", "0") != "0" else "",
+            "memory": "%.1f MB" % (int(memory) / 1048576) if memory.isdigit() else "",
+            "logs": clamp_text(logs.decode("utf-8", "replace").strip(), PREVIEW_CLIP_CHARS)}
+
+
+def _preview_mount(target):
+    if not target.startswith("/") or len(target) > FILES_PATH_CHARS or "\x00" in target:
+        raise Denied("bad mount")
+    # df rather than statvfs: a dead network mount hangs the caller, and only
+    # a child process can be torn down at the deadline.
+    raw, _ = view_output(["df", "--block-size=1", "--output=size,used,avail", "--", target],
+                         MOUNTS_BYTES, MOUNTS_DEADLINE, "mount unavailable")
+    fields = raw.decode("utf-8", "replace").splitlines()[-1].split()
+    if len(fields) != 3 or not all(f.isdigit() for f in fields):
+        raise Denied("mount unavailable")
+    size, used, free = (int(f) for f in fields)
+    return {"size": size, "used": used, "free": free}
+
+
+PREVIEW_VIEWS = {
+    "process": (1, _preview_process),
+    "ssh": (1, _preview_ssh),
+    "docker": (1, _preview_docker),
+    "service": (2, _preview_service),
+    "mount": (1, _preview_mount),
+}
+
+
+def cmd_preview_view(argv):
+    if not argv or argv[0] not in PREVIEW_VIEWS:
+        raise Denied("unknown preview")
+    arity, handler = PREVIEW_VIEWS[argv[0]]
+    if len(argv) != arity + 1:
+        raise Denied("bad preview arguments")
+    emit(handler(*argv[1:]))
+
+
+def view_output(argv, cap, deadline, message, allow_partial=False):
+    raw, truncated, status = run_bounded(argv, cap, deadline, want_status=True)
+    if (status != 0 and (not allow_partial or not truncated)) \
+            or (truncated and (not allow_partial or not raw)):
+        raise Denied(message)
+    return (raw.rpartition(b"\n")[0] if truncated else raw), truncated
+
+
+def cmd_ports():
+    raw, truncated = view_output(
+        ["ss", "-H", "-lntup"], PORTS_BYTES, PORTS_DEADLINE,
+        "cannot list listening ports", allow_partial=True)
+    lines = raw.decode("utf-8", "replace").splitlines()
+    rows = []
+    for line in lines:
+        parts = line.split(None, 6)
+        if len(parts) < 6 or parts[0] not in ("tcp", "udp"):
+            continue
+        try:
+            host, port_text = parts[4].rsplit(":", 1)
+            port = int(port_text)
+            if not 1 <= port <= 65535:
+                continue
+            # ss prints a scoped IPv6 listener as [fe80::1]%eno1.
+            host = host.replace("[", "").replace("]", "")
+            if host == "*":
+                endpoint, url_host = "*:" + port_text, "localhost"
+            else:
+                address_host = host.split("%", 1)[0]
+                address = ipaddress.ip_address(address_host)
+                endpoint_host = "[" + host + "]" if address.version == 6 else host
+                endpoint = endpoint_host + ":" + port_text
+                if address.is_unspecified:
+                    url_host = "localhost"
+                elif address.version == 6:
+                    url_host = endpoint_host.replace("%", "%25")
+                else:
+                    url_host = address_host
+        except (ValueError, IndexError):
+            continue
+        process = PORT_PROCESS_RE.search(line)
+        rows.append({
+            "protocol": parts[0].upper(), "port": port, "endpoint": endpoint,
+            "url": "http://%s:%d" % (url_host, port) if parts[0] == "tcp" else "",
+            "process": clamp_text(process.group(1), 128).strip() if process else "",
+            "pid": int(process.group(2)) if process else None,
+        })
+    rows.sort(key=lambda row: (row["port"], row["protocol"], row["endpoint"]))
+    unique = {}
+    for row in rows:
+        unique.setdefault((row["protocol"], row["endpoint"], row["pid"]), row)
+    rows = list(unique.values())
+    emit({"ports": rows[:PORTS_COUNT], "partial": truncated or len(rows) > PORTS_COUNT})
+
+
+def cmd_docker():
+    raw, truncated = view_output(
+        # One row past the cap shows whether the cap cut anything off.
+        ["docker", "container", "ls", "--all", "--last", str(DOCKER_COUNT + 1),
+         "--no-trunc", "--size=false", "--format", "{{json .}}"],
+        DOCKER_BYTES, DOCKER_DEADLINE, "Docker is unavailable", allow_partial=True)
+    rows = []
+    for line in raw.decode("utf-8", "replace").splitlines():
+        try:
+            item = json.loads(line)
+        except ValueError:
+            raise Denied("invalid Docker output")
+        if not isinstance(item, dict):
+            raise Denied("invalid Docker output")
+        container_id = str(item.get("ID") or item.get("Id") or "")
+        if not DOCKER_ID_RE.fullmatch(container_id):
+            continue
+        names = item.get("Names", "")
+        if isinstance(names, list):
+            names = names[0] if names else ""
+        ports = item.get("Ports", "")
+        if isinstance(ports, list):
+            ports = ", ".join(str(port) for port in ports if isinstance(port, str))
+        rows.append({
+            "id": container_id,
+            "name": clamp_text(names, 128),
+            "image": clamp_text(item.get("Image"), 160),
+            "state": clamp_text(item.get("State"), 32).lower(),
+            "status": clamp_text(item.get("Status"), 100),
+            "ports": clamp_text(ports, 160),
+        })
+    rows.sort(key=lambda row: (row["state"] != "running", row["name"].lower()))
+    emit({"containers": rows[:DOCKER_COUNT],
+          "partial": truncated or len(rows) > DOCKER_COUNT})
+
+
+def service_snapshot():
+    rows = []
+    scopes = []
+    answered = False
+    partial = False
+    for scope in ("user", "system"):
+        argv = ["systemctl", "--" + scope, "list-units", "--all",
+                "--type=service", "--full", "--plain", "--no-legend", "--no-pager"]
+        try:
+            raw, truncated = view_output(
+                argv, SERVICES_BYTES, SERVICES_DEADLINE,
+                "services unavailable", allow_partial=True)
+        except Denied:
+            partial = True
+            continue
+        answered = True
+        scopes.append(scope)
+        partial = partial or truncated
+        for line in raw.decode("utf-8", "replace").splitlines():
+            parts = line.split(None, 5)
+            if len(parts) > 1 and parts[1].endswith(".service"):
+                parts = parts[1:]
+            if len(parts) < 4 or not parts[0].endswith(".service"):
+                continue
+            name, _load, active, sub = parts[:4]
+            if len(name) > 180 or any(ord(ch) < 33 for ch in name):
+                continue
+            rows.append({
+                "name": name, "scope": scope,
+                "active": clamp_text(active, 32),
+                "sub": clamp_text(sub, 32),
+                "description": clamp_text(" ".join(parts[4:]), 160),
+            })
+    if not answered:
+        raise Denied("services unavailable")
+    rows.sort(key=lambda row: (
+        0 if row["active"] == "failed" else 1 if row["active"] == "active" else 2,
+        row["scope"] != "user", row["name"].lower()))
+    return {"services": rows[:SERVICES_COUNT], "partial": partial or len(rows) > SERVICES_COUNT, "scopes": scopes}
+
+
+def cmd_services():
+    data = service_snapshot()
+    emit({"services": data["services"], "partial": data["partial"]})
+
+
+def cmd_mounts():
+    raw, _ = view_output(
+        ["findmnt", "--json", "--list", "--real", "--nocanonicalize",
+         "--output", "TARGET,SOURCE,FSTYPE"],
+        MOUNTS_BYTES, MOUNTS_DEADLINE, "mounts unavailable")
+    try:
+        filesystems = json.loads(raw).get("filesystems", [])
+        if not isinstance(filesystems, list):
+            raise ValueError
+    except (ValueError, AttributeError):
+        raise Denied("invalid mount list")
+    by_target = {}
+    for entry in filesystems:
+        if not isinstance(entry, dict):
+            continue
+        target = entry.get("target")
+        if not isinstance(target, str) or not target.startswith("/") or len(target) > 1024 \
+                or any(ord(ch) < 32 for ch in target):
+            continue
+        # findmnt lists mounts in mount order, so the last one on a target is
+        # the one visible there. --real hides a pseudo filesystem mounted on
+        # top, which leaves the real one underneath listed instead.
+        by_target[target] = {
+            "target": target,
+            "source": clamp_text(entry.get("source"), 256),
+            "fstype": clamp_text(entry.get("fstype"), 64),
+        }
+    rows = list(by_target.values())
+    emit({"mounts": rows[:MOUNTS_COUNT], "partial": len(rows) > MOUNTS_COUNT})
+
+
+def cmd_audio():
+    def read(argv, cap=AUDIO_BYTES):
+        raw, _ = view_output(argv, cap, AUDIO_DEADLINE, "audio unavailable")
+        try:
+            return json.loads(raw)
+        except ValueError:
+            raise Denied("invalid audio device list")
+
+    info = read(["pactl", "-f", "json", "info"], 8192)
+    if not isinstance(info, dict):
+        raise Denied("invalid audio device list")
+    rows = []
+    for kind, resource, default_key in (
+            ("output", "sinks", "default_sink_name"),
+            ("input", "sources", "default_source_name")):
+        devices = read(["pactl", "-f", "json", "list", resource])
+        if not isinstance(devices, list):
+            raise Denied("invalid audio device list")
+        for device in devices:
+            if not isinstance(device, dict):
+                continue
+            name = device.get("name")
+            if not isinstance(name, str) or not name or name.startswith("-") \
+                    or len(name) > 256 or any(ord(ch) < 32 for ch in name):
+                continue
+            props = device.get("properties") or {}
+            if kind == "input" and (name.endswith(".monitor")
+                    or isinstance(props, dict) and props.get("device.class") == "monitor"):
+                continue
+            volume = device.get("volume") or {}
+            channel = next(iter(volume.values()), {}) if isinstance(volume, dict) else {}
+            percentage = channel.get("value_percent", "") if isinstance(channel, dict) else ""
+            node = props.get("object.id") if isinstance(props, dict) else None
+            rows.append({
+                "kind": kind,
+                "name": name,
+                "id": node if isinstance(node, str) and re.fullmatch(r"\d{1,10}", node) else "",
+                "description": clamp_text(device.get("description"), 160).replace("\n", " "),
+                "default": name == info.get(default_key),
+                "volume": percentage if isinstance(percentage, str)
+                    and re.fullmatch(r"\d{1,3}%", percentage) else "",
+                "muted": device.get("mute") is True,
+            })
+    rows.sort(key=lambda row: (row["kind"] != "output", not row["default"],
+                               row["description"].lower()))
+    emit({"devices": rows[:AUDIO_COUNT], "partial": len(rows) > AUDIO_COUNT})
+
+
+def _nmcli_fields(line):
+    fields, field, escaped = [], [], False
+    for char in line:
+        if escaped:
+            field.append(char)
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == ":":
+            fields.append("".join(field))
+            field = []
+        else:
+            field.append(char)
+    fields.append("".join(field))
+    return fields
+
+
+def cmd_wifi():
+    raw, truncated = view_output(
+        ["nmcli", "-t", "--escape", "yes", "-f", "IN-USE,SSID-HEX,SIGNAL,SECURITY",
+         "device", "wifi", "list", "--rescan", "no"],
+        WIFI_BYTES, WIFI_DEADLINE, "Wi-Fi unavailable", allow_partial=True)
+    by_name = {}
+    for line in raw.decode("utf-8", "replace").splitlines():
+        fields = _nmcli_fields(line)
+        if len(fields) != 4:
+            continue
+        active, ssid_hex, strength, security = fields
+        if not re.fullmatch(r"(?:[0-9A-Fa-f]{2}){1,32}", ssid_hex):
+            continue
+        try:
+            ssid = bytes.fromhex(ssid_hex).decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        if any(unicodedata.category(ch) in ("Cc", "Cf") for ch in ssid):
+            continue
+        row = {"ssid": ssid, "connected": active == "*",
+               "signal": int(strength) if strength.isdigit() and int(strength) <= 100 else 0,
+               "security": clamp_text(security, 64)}
+        previous = by_name.get(ssid)
+        if previous is None or (row["connected"], row["signal"]) > \
+                (previous["connected"], previous["signal"]):
+            by_name[ssid] = row
+    rows = sorted(by_name.values(), key=lambda row: (
+        not row["connected"], -row["signal"], row["ssid"].lower()))
+    emit({"networks": rows[:WIFI_COUNT], "partial": truncated or len(rows) > WIFI_COUNT})
+
+
+def cmd_bluetooth():
+    raw, _ = view_output(
+        ["busctl", "--json=short", "call", "org.bluez", "/",
+         "org.freedesktop.DBus.ObjectManager", "GetManagedObjects"],
+        BLUETOOTH_BYTES, BLUETOOTH_DEADLINE, "Bluetooth unavailable")
+    try:
+        objects = json.loads(raw)["data"][0]
+        if not isinstance(objects, dict):
+            raise ValueError
+    except (ValueError, KeyError, IndexError, TypeError):
+        raise Denied("invalid Bluetooth device list")
+    rows = []
+    for interfaces in objects.values():
+        if not isinstance(interfaces, dict):
+            continue
+        device = interfaces.get("org.bluez.Device1")
+        if not isinstance(device, dict) or device.get("Paired", {}).get("data") is not True:
+            continue
+        address = device.get("Address", {}).get("data")
+        name = device.get("Alias", {}).get("data")
+        if not isinstance(address, str) or not BLUETOOTH_ADDRESS_RE.fullmatch(address) \
+                or not isinstance(name, str) or not name \
+                or any(unicodedata.category(ch) in ("Cc", "Cf") for ch in name):
+            continue
+        rows.append({"address": address.upper(), "name": name[:160],
+                     "connected": device.get("Connected", {}).get("data") is True})
+    rows.sort(key=lambda row: (not row["connected"], row["name"].lower()))
+    emit({"devices": rows[:BLUETOOTH_COUNT],
+          "partial": len(rows) > BLUETOOTH_COUNT})
+
+
+def cmd_ssh_hosts():
+    home = os.environ.get("HOME", "")
+    root = os.path.join(home, ".ssh")
+    hosts = []
+    seen_hosts = set()
+    seen_files = set()
+    partial = False
+
+    def scan(path, depth=0):
+        nonlocal partial
+        if depth > 4 or len(seen_files) >= SSH_FILES:
+            partial = True
+            return
+        path = os.path.abspath(path)
+        if os.path.commonpath((root, path)) != root or path in seen_files:
+            return
+        seen_files.add(path)
+        parts = os.path.relpath(path, root).split(os.sep)
+        try:
+            fd = walk((".ssh", *parts[:-1]))
+            try:
+                raw = read_file(fd, parts[-1], SSH_CONFIG_BYTES)
+            finally:
+                os.close(fd)
+        except FileNotFoundError:
+            return
+        except (OSError, Denied):
+            partial = True
+            return
+        if raw is None:
+            return
+        global_scope = True
+        for line in raw.decode("utf-8", "replace").splitlines():
+            if len(hosts) > SSH_HOSTS:
+                break
+            if re.match(r"^\s*Match(?:\s|=)", line, re.I):
+                global_scope = False
+                continue
+            directive = SSH_DIRECTIVE_RE.match(line)
+            if not directive:
+                continue
+            try:
+                values = shlex.split(directive.group(2), comments=True)
+            except ValueError:
+                continue
+            if directive.group(1).lower() == "host":
+                global_scope = values == ["*"]
+                for alias in values:
+                    if SSH_ALIAS_RE.fullmatch(alias) and alias not in seen_hosts:
+                        seen_hosts.add(alias)
+                        hosts.append({"name": alias, "source": "config"})
+            elif global_scope:
+                for pattern in values:
+                    if pattern.startswith("~/"):
+                        pattern = os.path.join(home, pattern[2:])
+                    elif not os.path.isabs(pattern):
+                        pattern = os.path.join(root, pattern)
+                    if os.path.commonpath((root, os.path.abspath(pattern))) != root:
+                        continue
+                    for included in sorted(glob.glob(pattern))[:SSH_FILES]:
+                        scan(included, depth + 1)
+
+    scan(os.path.join(root, "config"))
+    try:
+        fd = walk((".ssh",))
+        try:
+            known = read_file(fd, "known_hosts", SSH_KNOWN_BYTES)
+        finally:
+            os.close(fd)
+    except FileNotFoundError:
+        known = None
+    except (OSError, Denied):
+        known = None
+        partial = True
+    if known:
+        for line in known.decode("utf-8", "replace").splitlines():
+            if len(hosts) > SSH_HOSTS:
+                break
+            fields = line.split(None, 2)
+            if len(fields) < 3 or fields[0].startswith(("#", "@")):
+                continue
+            for alias in fields[0].split(","):
+                if SSH_ALIAS_RE.fullmatch(alias) and alias not in seen_hosts:
+                    seen_hosts.add(alias)
+                    hosts.append({"name": alias, "source": "known_hosts"})
+                    if len(hosts) >= SSH_HOSTS:
+                        break
+    emit({"hosts": hosts[:SSH_HOSTS], "partial": partial or len(hosts) > SSH_HOSTS})
+
+
+def cmd_tldr(argv):
+    if len(argv) != 1:
+        raise Denied("tldr takes one page name")
+    # `tldr git commit` is the page git-commit; joining here means the name
+    # the regex vets is exactly the one that reaches `tldr`.
+    page = "-".join(clamp_text(argv[0], TLDR_FIELD_CHARS).lower().split())
+    if not TLDR_PAGE_RE.match(page):
+        raise Denied("bad tldr page name")
+    raw, _ = run_bounded(["tldr", "-m", "--", page], TLDR_BYTES, TLDR_DEADLINE)
+
+    # An unknown page is not an error to the client (exit 0, a one-line
+    # notice), so "found" is the presence of the markdown heading.
+    title = ""
+    description = []
+    url = ""
+    examples = []
+    pending = ""
+    for line in raw.decode("utf-8", "replace").split("\n"):
+        line = line.strip()
+        if line.startswith("# "):
+            title = clamp_text(line[2:], TLDR_FIELD_CHARS)
+        elif line.startswith("> "):
+            match = TLDR_URL_RE.search(line)
+            if match:
+                url = match.group(1)
+            else:
+                description.append(line[2:])
+        elif line.startswith("- "):
+            pending = TLDR_HINT_RE.sub(r"\1", line[2:].rstrip(":")).replace("`", "")
+            pending = pending[:1].upper() + pending[1:]
+        elif line.startswith("`") and pending and len(examples) < TLDR_EXAMPLES:
+            command = TLDR_OPTION_RE.sub(r"\1", line.strip("`")).replace("{{", "").replace("}}", "")
+            examples.append({"description": clamp_text(pending, TLDR_FIELD_CHARS),
+                             "command": clamp_text(command, TLDR_FIELD_CHARS)})
+            pending = ""
+    emit({"page": page, "found": bool(title), "title": title,
+          "description": clamp_text(" ".join(description), TLDR_FIELD_CHARS),
+          "url": url, "examples": examples})
+
+
+def cmd_write_ics(argv):
+    if len(argv) != 1 or not ICS_STAMP_RE.match(argv[0]):
+        raise Denied("bad event stamp")
+    body = read_stdin(ICS_BYTES)
+    if not body:
+        raise Denied("empty event")
+
+    downloads = os.environ.get("XDG_DOWNLOAD_DIR", "")
+    home = os.environ.get("HOME", "")
+    name = "Downloads"
+    if downloads.startswith(home + "/") and "/" not in downloads[len(home) + 1:]:
+        name = downloads[len(home) + 1:]
+    fd = walk([name], create=True)
+    try:
+        # O_EXCL is the whole symlink defence: a name that already exists —
+        # including one that exists only as a dangling symlink — is never
+        # opened, it is stepped over.
+        for attempt in range(20):
+            suffix = "" if attempt == 0 else "-%d" % attempt
+            filename = "omarchy-event-%s%s.ics" % (argv[0], suffix)
+            try:
+                out = os.open(filename,
+                              os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                              0o600, dir_fd=fd)
+            except FileExistsError:
+                continue
+            try:
+                view = memoryview(body)
+                while view:
+                    view = view[os.write(out, view):]
+                os.fsync(out)
+            finally:
+                os.close(out)
+            emit({"path": os.path.join(home, name, filename)})
+            return
+        raise Denied("could not find a free filename")
+    finally:
+        os.close(fd)
+
+
+def cmd_write_settings():
+    """Merge a patch of known keys into spotlight.json; unknown keys on disk survive."""
+    raw = read_stdin(SETTINGS_BYTES)
+    try:
+        patch = json.loads(raw.decode("utf-8", "replace")) if raw else None
+    except ValueError:
+        patch = None
+    if not isinstance(patch, dict):
+        raise Denied("settings patch is not a JSON object")
+    fd = walk([".config", "omarchy"], create=True)
+    try:
+        raw = read_file(fd, "spotlight.json", SETTINGS_BYTES)
+        try:
+            existing = json.loads(raw.decode("utf-8", "replace")) if raw else {}
+        except ValueError:
+            existing = None
+        if not isinstance(existing, dict):
+            # A hand edit that no longer parses is never overwritten.
+            raise Denied("spotlight.json is not a JSON object")
+        known = normalize_settings({})
+        for key in known:
+            if key in patch:
+                if key == "artifactSettings" and isinstance(patch[key], dict):
+                    current = existing.get(key) if isinstance(existing.get(key), dict) else {}
+                    weather = patch[key].get("weather")
+                    if isinstance(weather, dict):
+                        current_weather = current.get("weather") if isinstance(current.get("weather"), dict) else {}
+                        current["weather"] = {**current_weather, **weather}
+                    existing[key] = current
+                else:
+                    existing[key] = patch[key]
+        settings = normalize_settings(existing)
+        for key in known:
+            if key in patch:
+                existing[key] = settings[key]
+        payload = (json.dumps(existing, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+        if len(payload) > SETTINGS_BYTES:
+            raise Denied("spotlight.json would be larger than %d bytes" % SETTINGS_BYTES)
+        # ponytail: no lock - Spotlight.qml funnels every write through one
+        # Process; wrap in lock_at() if a second writer ever appears.
+        write_atomic(fd, "spotlight.json", payload)
+    finally:
+        os.close(fd)
+    emit({"settings": settings})
+
+
+# ---------------------------------------------------------------- bindings
+def _hypr_dir():
+    try:
+        return walk([".config", "hypr"])
+    except FileNotFoundError:
+        raise Denied("~/.config/hypr is missing")
+
+
+def _bindings_lines(dirfd):
+    raw = read_file(dirfd, "bindings.lua", BINDINGS_BYTES)
+    return None if raw is None else raw.decode("utf-8", "surrogateescape").split("\n")
+
+
+def _write_bindings(dirfd, lines):
+    try:
+        mode = stat.S_IMODE(os.stat("bindings.lua", dir_fd=dirfd, follow_symlinks=False).st_mode)
+    except FileNotFoundError:
+        mode = 0o644
+    write_atomic(dirfd, "bindings.lua", "\n".join(lines).encode("utf-8", "surrogateescape"), mode)
+
+
+def _canon_chord(text):
+    """'SUPER SHIFT CTRL + SPACE' or 'ctrl+space' -> 'SUPER + CTRL + SHIFT + SPACE'; None if malformed."""
+    parts = [CHORD_ALIASES.get(p, p)
+             for p in re.split(r"[\s+]+", str(text).upper()) if p]
+    keys = [p for p in parts if p not in CHORD_MODS]
+    if len(keys) != 1:
+        return None
+    return " + ".join([m for m in CHORD_MODS if m in parts] + keys)
+
+
+def _hypr_socket_path():
+    """Path to this Hyprland instance's IPC socket, or None."""
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or ""
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") or ""
+    if not runtime.startswith("/") or not sig or "/" in sig or sig in (".", ".."):
+        return None
+    return os.path.join(runtime, "hypr", sig, HYPR_SOCKET_NAME)
+
+
+def _hypr_request(payload):
+    """One bounded round trip to Hyprland's IPC socket. -> bytes, or None."""
+    path = _hypr_socket_path()
+    if path is None:
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if not stat.S_ISSOCK(st.st_mode) or st.st_uid != EUID:
+        return None
+    end = time.monotonic() + HYPR_BINDS_DEADLINE
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        try:
+            sock.settimeout(HYPR_BINDS_DEADLINE)
+            sock.connect(path)
+            sock.sendall(payload)
+        except OSError:
+            return None
+        chunks = []
+        total = 0
+        while True:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                sock.settimeout(remaining)
+                chunk = sock.recv(65536)
+            except OSError:
+                return None
+            if not chunk:
+                return b"".join(chunks)
+            total += len(chunk)
+            if total > HYPR_BINDS_BYTES:
+                return None
+            chunks.append(chunk)
+    finally:
+        sock.close()
+
+
+def _hypr_flag(record, name):
+    """A `j/binds` boolean, which Hyprland writes as the string "true"."""
+    value = record.get(name)
+    if isinstance(value, bool):
+        return value
+    return isinstance(value, str) and value.strip().lower() == "true"
+
+
+def _hypr_mods(record):
+    """The modifier set of a `j/binds` record, in _chord_mods form."""
+    modmask = record.get("modmask")
+    if not isinstance(modmask, int) or isinstance(modmask, bool):
+        return None
+    named = [name for bit, name in HYPR_MODMASK if modmask & bit]
+    return " + ".join([m for m in CHORD_MODS if m in named])
+
+
+def _canon_hypr_bind(record):
+    """One `j/binds` record -> canonical chord, or None if it names none."""
+    key = record.get("key")
+    modmask = record.get("modmask")
+    if not isinstance(key, str) or not key or not isinstance(modmask, int):
+        return None
+    if isinstance(modmask, bool):
+        # Not a mask Hyprland would send. Reading it as one would name a
+        # chord this record does not hold, so it counts as a hole instead.
+        return None
+    mods = [name for bit, name in HYPR_MODMASK if modmask & bit]
+    # A modmask bit outside HYPR_MODMASK (CapsLock, NumLock) makes the real
+    # bind narrower than the chord named here. Naming it anyway can only
+    # report a free chord as taken, which costs the user one manual choice.
+    # Returning None instead is not a quiet drop: _bound_chords treats an
+    # unnameable record as a hole in the table.
+    return _canon_chord(" + ".join(mods + [key]))
+
+
+def _print_chords():
+    """Chords `omarchy-menu-keybindings --print` names, chord -> description.
+
+    None means the run itself failed, which is not the same answer as an
+    empty table: a table missing a bind Hyprland actually holds reads as a
+    free chord, so the caller has to tell the two apart.
+    """
+    try:
+        raw, truncated, status = run_bounded(
+            ["omarchy-menu-keybindings", "--print"],
+            BINDINGS_PRINT_BYTES, BINDINGS_PRINT_DEADLINE, want_status=True)
+    except Denied:
+        return None
+    if truncated or status != 0:
+        return None
+    named = {}
+    for line in raw.decode("utf-8", "replace").split("\n"):
+        left, arrow, desc = line.partition("\u2192")
+        chord = _canon_chord(left) if arrow else None
+        if chord and chord not in named:
+            named[chord] = clamp_text(desc, BINDINGS_DESC_CHARS).strip()
+    return named
+
+
+def _chord_mods(chord):
+    """'SUPER + ALT + 9' -> 'SUPER + ALT'; a chord with no modifier -> ''."""
+    parts = str(chord).split(" + ")
+    return " + ".join([m for m in CHORD_MODS if m in parts])
+
+
+def _bound_chords():
+    """The live bind table. -> (chord -> description, unreliable mod sets).
+
+    A bound table of None means the compositor did not answer, and callers
+    must then leave every chord alone: an unanswered bind table is
+    indistinguishable from an empty one, and an empty one reads as "every
+    chord is free".
+
+    The second value names the modifier sets the table cannot speak for,
+    because Hyprland reported a bind under them that this reply does not let
+    us name. Absence of a chord under one of those is not evidence the chord
+    is free; absence under any other modifier set is.
+
+    Two limits worth stating, since callers read absence as a fact. This
+    answers for binds the compositor holds, not for shortcuts some other
+    program grabs - the browser-extension chords in --print's static list
+    reach the table only through the merge below, and vanish with it. And a
+    bind carrying Hyprland's ignore_mods flag fires under modifier sets
+    other than its own, which `j/binds` does not report in either format on
+    0.56, so a modmask is taken at face value as the reach of its bind.
+    """
+    raw = _hypr_request(b"j/binds")
+    if raw is None:
+        return None, []
+    try:
+        records = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None, []
+    if not isinstance(records, list) or not records:
+        return None, []
+    bound = {}
+    unknown = set()
+    for record in records:
+        if not isinstance(record, dict):
+            return None, []
+        # A bind under a submap only fires after that submap is entered, so
+        # it does not occupy the chord in the default map - unless it is
+        # marked universal, which is exactly the flag that makes it fire
+        # everywhere. Hyprland serializes that one as the string "true",
+        # so Python truthiness would read "false" as yes.
+        if record.get("submap") and not _hypr_flag(record, "submap_universal"):
+            continue
+        chord = _canon_hypr_bind(record)
+        if chord is None:
+            # A live bind this reply does not let us name - on Hyprland 0.56
+            # every `SUPER + code:10` lands here. Its modifiers are still
+            # known, so the damage is contained to them.
+            mods = _hypr_mods(record)
+            if mods is None:
+                # Not even the modifiers. Nothing scopes the damage, so the
+                # whole table stops being evidence.
+                return None, []
+            unknown.add(mods)
+            continue
+        if chord in bound:
+            continue
+        desc = record.get("description")
+        bound[chord] = clamp_text(desc if isinstance(desc, str) else "",
+                                  BINDINGS_DESC_CHARS).strip()
+    if not bound:
+        return None, []
+    # --print is merged for what it can name, never to clear `unknown`: it
+    # naming one chord under SUPER is no evidence it named every SUPER bind
+    # the socket could not, and this is exactly where counting entries would
+    # turn into a guess. An unreliable modifier set stays unreliable until
+    # the compositor itself names those binds.
+    for chord, desc in (_print_chords() or {}).items():
+        if not bound.get(chord):
+            bound[chord] = desc
+    return bound, sorted(unknown)
+
+
+def _strip_managed(lines):
+    """Drop the managed block and the blank line before it. -> (lines, block contents)"""
+    start = next((i for i, line in enumerate(lines) if line.strip() == MARK_START), None)
+    if start is None:
+        return lines, []
+    end = next((i for i in range(start, len(lines)) if lines[i].strip() == MARK_END), None)
+    if end is None:
+        raise Denied("managed block in bindings.lua is not closed")
+    block = lines[start + 1:end]
+    if start and lines[start - 1].strip() == "":
+        start -= 1
+    return lines[:start] + lines[end + 1:], block
+
+
+def _lua_call_end(lines, start):
+    """Return the last line of an o.bind call, ignoring parentheses inside strings."""
+    depth = 0
+    quote = None
+    escaped = False
+    opened = False
+    for end in range(start, len(lines)):
+        line = lines[end]
+        i = line.find("o.bind") if end == start else 0
+        while i < len(line):
+            char = line[i]
+            if quote:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    quote = None
+            elif line.startswith("--", i):
+                break
+            elif char in "\"'":
+                quote = char
+            elif char == "(":
+                depth += 1
+                opened = True
+            elif char == ")":
+                depth -= 1
+                if opened and depth == 0:
+                    return end
+            i += 1
+    raise Denied("Spotlight binding in bindings.lua is not closed")
+
+
+def _disable_toggle_calls(lines):
+    """Comment every line of each live Spotlight toggle call."""
+    lines = list(lines)
+    i = 0
+    while i < len(lines):
+        match = TOGGLE_RE.match(lines[i])
+        if not match:
+            i += 1
+            continue
+        end = _lua_call_end(lines, i)
+        if i:
+            unbind = UNBIND_RE.match(lines[i - 1])
+            if unbind and _canon_chord(unbind.group(1)) == _canon_chord(match.group("chord")):
+                lines[i - 1] = DISABLED_PREFIX + lines[i - 1]
+        for line_no in range(i, end + 1):
+            lines[line_no] = DISABLED_PREFIX + lines[line_no]
+        i = end + 1
+    return lines
+
+
+def cmd_read_binding():
+    bound, unknown_mods = _bound_chords()
+    reply = {"current": None, "previous": None, "managed": False,
+             "bound": bound, "unknownMods": unknown_mods}
+    try:
+        fd = walk([".config", "hypr"])
+    except FileNotFoundError:
+        emit(reply)
+        return
+    try:
+        lines = _bindings_lines(fd) or []
+    finally:
+        os.close(fd)
+    for line in lines:
+        if line.strip() == MARK_START:
+            reply["managed"] = True
+        elif line.startswith(DISABLED_PREFIX):
+            old = TOGGLE_RE.match(line[len(DISABLED_PREFIX):])
+            if old and reply["previous"] is None:
+                reply["previous"] = old.group("chord")
+        else:
+            live = TOGGLE_RE.match(line)
+            if live and reply["current"] is None:
+                reply["current"] = live.group("chord")
+    emit(reply)
+
+
+def _chord_is_known(chord, bound, unknown_mods):
+    """Whether `bound` can be trusted to say this chord is free."""
+    return bound is not None and _chord_mods(chord) not in unknown_mods
+
+
+def cmd_write_binding(argv):
+    if len(argv) != 1 or "+" not in argv[0] or not CHORD_RE.match(argv[0]):
+        raise Denied("bad chord")
+    chord = argv[0]
+    unbind = 'hl.unbind("%s")' % chord
+    fd = _hypr_dir()
+    try:
+        original = _bindings_lines(fd)
+        new_file = original is None
+        lines = original or [""]
+        own = {_canon_chord(m.group("chord")) for m in map(TOGGLE_RE.match, lines) if m}
+        lines, block = _strip_managed(lines)
+        lines = _disable_toggle_calls(lines)
+        # Unbind a chord someone else holds, and keep an unbind the previous
+        # block already carried: hyprctl reload rebuilds every default, so
+        # "not bound right now" may only mean our own block removed it.
+        bound, unknown_mods = _bound_chords()
+        unbound = (any(line.strip() == unbind for line in block)
+                   or not _chord_is_known(chord, bound, unknown_mods)
+                   or (chord in bound and chord not in own))
+        block = [MARK_START] + ([unbind] if unbound else []) + [
+            'o.bind("%s", "Spotlight", "%s")' % (chord, TOGGLE_CMD), MARK_END]
+        body = "\n".join(lines)
+        trailing_newline = body.endswith("\n")
+        if body:
+            body += "\n" if trailing_newline else "\n\n"
+        body += "\n".join(block)
+        if trailing_newline or new_file:
+            body += "\n"
+        _write_bindings(fd, body.split("\n"))
+    finally:
+        os.close(fd)
+    emit({"chord": chord, "unbound": unbound,
+          "path": os.path.join(os.environ["HOME"], ".config", "hypr", "bindings.lua")})
+
+
+def cmd_revert_binding():
+    fd = _hypr_dir()
+    try:
+        original = _bindings_lines(fd)
+        if original is None:
+            emit({"restored": None})
+            return
+        lines, _ = _strip_managed(original)
+        restored = None
+        for i, line in enumerate(lines):
+            if line.startswith(DISABLED_PREFIX):
+                lines[i] = line = line[len(DISABLED_PREFIX):]
+                live = TOGGLE_RE.match(line)
+                if live and restored is None:
+                    restored = live.group("chord")
+        if lines != original:
+            _write_bindings(fd, lines)
+    finally:
+        os.close(fd)
+    emit({"restored": restored})
+
+
+# name -> (handler, whether it reads positional arguments)
+COMMANDS = {
+    "read-settings": (cmd_read_settings, False),
+    "ensure-settings": (cmd_ensure_settings, False),
+    "ensure-data": (cmd_ensure_data, False),
+    "reset-usage": (cmd_reset_usage, False),
+    "read-usage": (cmd_read_usage, False),
+    "read-hides": (cmd_read_hides, False),
+    "read-menu-commands": (cmd_read_menu_commands, False),
+    "read-plugins": (cmd_read_plugins, False),
+    "summon-plugin": (cmd_summon_plugin, True),
+    "write-usage": (cmd_write_usage, False),
+    "read-clipboard": (cmd_read_clipboard, False),
+    "clipboard-copy": (cmd_clipboard_copy, True),
+    "reminders": (cmd_reminders, False),
+    "toggle-states": (cmd_toggle_states, False),
+    "suggest": (cmd_suggest, True),
+    "currency-rate": (cmd_currency_rate, True),
+    "currency-rates": (cmd_currency_rates, True),
+    "files": (cmd_files, True),
+    "preview-file": (cmd_preview_file, True),
+    "browse-directory": (lambda argv: cmd_preview_file(argv, browse=True), True),
+    "preview-view": (cmd_preview_view, True),
+    "clipboard-preview": (cmd_clipboard_preview, True),
+    "ports": (cmd_ports, False),
+    "docker": (cmd_docker, False),
+    "services": (cmd_services, False),
+    "mounts": (cmd_mounts, False),
+    "audio": (cmd_audio, False),
+    "wifi": (cmd_wifi, False),
+    "bluetooth": (cmd_bluetooth, False),
+    "ssh-hosts": (cmd_ssh_hosts, False),
+    "tldr": (cmd_tldr, True),
+    "write-ics": (cmd_write_ics, True),
+    "write-settings": (cmd_write_settings, False),
+    "read-binding": (cmd_read_binding, False),
+    "write-binding": (cmd_write_binding, True),
+    "revert-binding": (cmd_revert_binding, False),
+}
+
+
+def ai_result(raw, provider, allow_weather=False, weather_request=False):
+    try:
+        value = json.loads(raw.decode("utf-8"))
+        if provider == "claude":
+            value = value.get("structured_output") or value.get("result")
+            if isinstance(value, str):
+                value = json.loads(value)
+    except (UnicodeError, ValueError, AttributeError, TypeError):
+        raise Denied("AI returned an invalid response")
+    if not isinstance(value, dict) or value.get("kind") not in ("answer", "command", "steps"):
+        raise Denied("AI returned an invalid response")
+    kind, body, commands = value["kind"], value.get("text"), value.get("commands")
+    artifacts = value.get("artifacts", [])
+    if (not isinstance(body, str) or not isinstance(commands, list) or len(commands) > 6
+            or not isinstance(artifacts, list) or len(artifacts) > 2):
+        raise Denied("AI returned an invalid response")
+    weather = value.get("weather")
+    if weather_request and isinstance(weather, dict) and weather.get("type") == "weather":
+        artifacts = [weather]
+    if len(body) > AI_TEXT_CHARS:
+        body = body[:AI_TEXT_CHARS] + "…"
+    if "\n" not in body and "\\n" in body:
+        body = body.replace("\\n", "\n")
+    if any(unsafe(char) and char not in "\n\r\t" for char in body):
+        raise Denied("AI returned unsafe control characters in answer text")
+    clean = []
+    for item in commands:
+        if not isinstance(item, dict):
+            raise Denied("AI returned an invalid command")
+        command, explanation = item.get("command"), item.get("explanation")
+        if (not isinstance(command, str) or not command.strip() or len(command) > 2048
+                or any(unsafe(char) for char in command)
+                or not isinstance(explanation, str)):
+            raise Denied("AI returned an invalid command")
+        clean.append({"command": command.strip(), "explanation": explanation[:1024]})
+    if (kind == "answer" and clean) or (kind == "command" and len(clean) != 1) or (kind == "steps" and not clean):
+        raise Denied("AI returned an invalid response")
+    validated_artifacts = []
+    artifact_warnings = []
+    for item in artifacts:
+        if not isinstance(item, dict):
+            continue
+        kind_validator = ARTIFACT_VALIDATORS.get(item.get("type"))
+        if (not kind_validator or (item.get("type") == "weather" and not allow_weather)
+                or (item.get("type") == "map" and weather_request)):
+            continue
+        try:
+            validated_artifacts.append(kind_validator(item))
+        except (Denied, ValueError, TypeError, KeyError) as error:
+            # A malformed card should not discard an otherwise useful answer.
+            if item.get("type") != "weather":
+                artifact_warnings.append(item["type"].capitalize() + " card could not be displayed: "
+                                         + str(error)[:160] + ". Try again.")
+            continue
+    if weather_request and not any(item["type"] == "weather" for item in validated_artifacts):
+        message = ("Enable AI web search in Settings to fetch weather." if not allow_weather
+                   else "The returned weather data could not be validated. Try again or specify a location."
+                   if isinstance(weather, dict) and weather.get("type") == "weather"
+                   else "No verified weather data was returned. See the answer above for details.")
+        validated_artifacts.append({"type": "weather", "variant": "unavailable", "location": "Weather",
+                                    "days": [], "sourceUrl": "", "retrievedAt": "", "message": message})
+    result = {"kind": kind, "text": body, "commands": clean, "artifacts": validated_artifacts}
+    if artifact_warnings:
+        result["artifactWarnings"] = artifact_warnings
+    return result
+
+
+def ai_stream_event(raw, provider):
+    """Return (progress, final) from a provider's JSONL event, if present."""
+    try:
+        event = json.loads(raw)
+    except (ValueError, UnicodeError):
+        return "", None
+    if not isinstance(event, dict):
+        return "", None
+    if provider == "claude":
+        if event.get("type") == "result":
+            return "", event.get("structured_output") or event.get("result")
+        if event.get("type") == "stream_event":
+            stream = event.get("event")
+            delta = stream.get("delta") if isinstance(stream, dict) else None
+            if isinstance(delta, dict) and delta.get("type") == "thinking_delta":
+                return str(delta.get("thinking", ""))[:1024], None
+            if isinstance(delta, dict) and delta.get("type") == "text_delta":
+                return str(delta.get("text", ""))[:1024], None
+        return "", None
+    item = event.get("item")
+    if not isinstance(item, dict):
+        return "", None
+    if event.get("type") == "item.completed" and item.get("type") == "agent_message":
+        return "", item.get("text")
+    if item.get("type") == "reasoning" and event.get("type") in ("item.updated", "item.completed"):
+        summary = item.get("text") or item.get("summary") or ""
+        if isinstance(summary, list):
+            summary = "\n".join(part.get("text", "") for part in summary if isinstance(part, dict))
+        return str(summary)[:2048], None
+    if event.get("type") == "item.started" and item.get("type") == "web_search":
+        return "Searching the web…\n", None
+    return "", None
+
+
+def ai_partial_text(fragment):
+    """Read the completed prefix of `text` from Claude's streamed tool input."""
+    match = re.search(r'"text"\s*:\s*"', fragment)
+    if not match:
+        return ""
+    start, escaped = match.end(), False
+    for pos in range(start, min(len(fragment), start + AI_TEXT_CHARS * 2)):
+        char = fragment[pos]
+        if char == '"' and not escaped:
+            break
+        if char == "\\" and not escaped:
+            escaped = True
+        else:
+            escaped = False
+    else:
+        pos = min(len(fragment), start + AI_TEXT_CHARS * 2)
+    raw = fragment[start:pos]
+    if raw.endswith("\\"):
+        raw = raw[:-1]
+    try:
+        return json.loads('"' + raw + '"')
+    except ValueError:
+        return ""
+
+
+def local_dashboard(card):
+    home = None
+    try:
+        fd = home_fd()
+        try:
+            home = os.readlink("/proc/self/fd/" + str(fd))
+        finally:
+            os.close(fd)
+    except (Denied, OSError):
+        pass
+    services = None
+    if card["focus"] in ("all", "services"):
+        try:
+            services = service_snapshot()
+        except Denied:
+            pass
+    def run(argv, cap, deadline, **kwargs):
+        try:
+            return run_bounded(argv, cap, deadline, **kwargs)
+        except Denied:
+            return b"", False, 1
+    return {**card, **system_snapshot(card["focus"], run, home, services)}
+
+
+def cmd_ai(argv):
+    if (len(argv) not in (4, 5, 6) or argv[0] not in ("claude", "codex")
+            or argv[3] not in ("true", "false")
+            or (len(argv) == 6 and argv[5] not in ("true", "false"))):
+        raise Denied("unknown AI provider")
+    provider, model, effort, web_search = argv[:4]
+    weather_location = argv[4] if len(argv) >= 5 else ""
+    weather_request = argv[5] == "true" if len(argv) == 6 else False
+    if (len(weather_location) > 120 or weather_location != weather_location.strip()
+            or any(ord(char) < 32 or unicodedata.category(char) == "Cf" for char in weather_location)):
+        raise Denied("invalid weather location")
+    if (model and not AI_MODEL_RE.fullmatch(model)) or (effort and effort not in AI_EFFORTS):
+        raise Denied("invalid AI model or effort")
+    query = read_stdin(4096).decode("utf-8", "replace").strip()
+    if not query or len(query) > 512:
+        raise Denied("AI query must be 1–512 characters")
+    schema_name = "ai-weather-result.schema.json" if weather_request else "ai-result.schema.json"
+    schema_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "resources", schema_name)
+    with open(schema_path, encoding="utf-8") as schema_file:
+        schema = schema_file.read()
+    language_rule = (
+        "The actual user's question is the text after 'User request:'. Follow an explicit "
+        "output-language request there; otherwise write every natural-language result field "
+        "in the language of that question. This includes text, command explanations and ALL "
+        "artifact titles, color labels, descriptions and weather summaries. For an English "
+        "question, every generated label must be English too. Do not switch languages because of web pages, the "
+        "system locale or a saved location. Keep proper names, URLs and commands intact."
+    )
+    instruction = (
+        "Follow an explicit output-language request; otherwise answer in the language of the user's question. "
+        "Return one structured result. "
+        "Write the text field as concise Markdown with short paragraphs and clear lists. "
+        "Separate paragraphs, headings, lists, and tables with blank lines. "
+        "Put runnable commands in the commands field rather than repeating them in the text. "
+        "Choose kind=answer for information, kind=command for one terminal command, "
+        "or kind=steps for a task requiring several commands. "
+        "For answer use commands=[]. For command use exactly one command. "
+        "For steps list up to six commands in execution order. "
+        "When a non-weather place request would benefit from a map, you may add one map artifact "
+        "with a short title, latitude, longitude and zoom (2–17). "
+        "For color scheme requests, include a palette artifact with a title and 2–8 colors, "
+        "each with a short role label and a six-digit HEX value (for example #14283F). "
+        "For numerical comparisons, trends or proportions, include a chart artifact: "
+        "variant=line, bar or donut; title, unit, category labels and named series of values. "
+        "Use 2–24 categories for lines, 2–12 for bars, or 2–8 categories and one nonnegative "
+        "series for donuts. Each series has a label and one value per category. Include a note "
+        "stating provenance (user-provided, illustrative example, or verified source), and "
+        "sourceUrl (HTTPS or an empty string). Never invent current or local-system measurements; "
+        "if measurements are missing, explain what is needed instead. "
+        "For comparing 2–4 products or approaches, include a comparison artifact with title, "
+        "a short provenance note and options. Each option has name, price (or 'Not applicable' "
+        "or 'Not verified'), summary, 1–4 pros, 1–4 cons, up to five facts (label/value), "
+        "sourceUrl (HTTPS or empty for conceptual comparisons) and recommended (boolean). "
+        "Use the same fact labels across options for comparable attributes. "
+        "Keep summaries within 200 characters, pros/cons within 120 characters each, "
+        "fact labels within 40, fact values within 100, and provenance notes within 240. "
+        "Recommend at most one option and explain the criteria. Verify current prices via web "
+        "search; do not invent prices or product specifications. "
+        "Keep text short when an artifact already communicates the answer. "
+        "For schedules, itineraries, project milestones or histories, include a timeline artifact "
+        "with title, a provenance note and 1–12 entries in chronological order. Each entry has "
+        "when (a readable date/time or phase label, up to 60 characters), title (up to 100), "
+        "description (up to 240), status (planned, current or done) and sourceUrl (HTTPS or empty). "
+        "Treat proposed plans as planned; never claim a step was completed. Clearly mark travel "
+        "plans as suggestions; only cite verified venue details or opening hours. "
+        "For explaining flows or relationships, include a diagram artifact with title, note, "
+        "sourceUrl (HTTPS or empty), 2–10 nodes and 1–16 directed edges. Each node has a unique "
+        "id (letters, digits, dash or underscore; up to 24 characters), label (up to 60), "
+        "column (0–2) and row (0–5). Place nodes at unique grid positions, keeping connections "
+        "between nearby nodes and using a single vertical column for sequential processes. "
+        "Each edge has from and to node IDs and a short label (up to 40 characters, or empty). "
+        "Use branches for alternative paths, not a prose list or a Mermaid code fence. "
+        "For task preparation or an actionable to-do plan, include a checklist artifact with title, "
+        "note (up to 240 characters), sourceUrl (HTTPS or empty), and 1–12 items. Each item has "
+        "title (up to 100 characters) and description (up to 240). Keep the answer brief when "
+        "the card covers the steps. Do not include completion states: only the user checks off tasks. "
+        "For questions about this computer's CPU, memory, disk usage or service status, include "
+        "a dashboard artifact with title and focus (all, cpu, memory, storage or services). "
+        "Spotlight fills it with a bounded local snapshot AFTER your answer; you cannot see these "
+        "measurements. Do not invent them or claim to have inspected the machine. Keep the text "
+        "to a brief explanation of what the snapshot can show, and propose commands only for "
+        "actions the user needs to take. Dashboard collection is read-only and local. "
+        "For restaurant, attraction or venue recommendations, include a places artifact with title, "
+        "note (up to 240 characters) and 1–4 places. Each place has name (up to 100), category "
+        "(up to 60), address (up to 180), hours (up to 160), summary (up to 180), rating (0–5 or null), "
+        "ratingSource (up to 60, empty when rating is null) and sourceUrl (HTTPS or empty). "
+        "Verify current opening hours, addresses and ratings with web search when available; otherwise "
+        "use explicitly supplied data or mark uncertain hours 'Not verified' and ratings null. "
+        "Never invent ratings, addresses or current opening hours. Explain provenance in note. "
+        "For 'nearby' without a stated location, ask for the location rather than guessing; the "
+        "weather default is not a general location setting. Spotlight builds map search links from "
+        "the venue name/address; do not supply coordinates or map URLs. "
+        "For proposed configuration edits, include a diff artifact with title, note (up to 240), "
+        "and 1–3 files. Each file has path (a display label up to 160 characters), before and after "
+        "(exact configuration text, at most 6000 characters, 120 lines and 300 characters per line). "
+        "Use the user's supplied configuration verbatim for before. If no current config was supplied, "
+        "clearly label the starting point as an illustrative example, not a file read from disk. "
+        "Empty before is a new file, empty after removes its contents. Do not place the diff in a "
+        "code fence too; Spotlight generates the diff and copy actions. These are previews only. "
+        "For wallpaper suggestions or visual image search, include a gallery artifact with title, note "
+        "and 1–8 images. Aim for six distinct images by default; respect the user's explicit image "
+        "count up to eight. If more than eight were requested, explain the eight-image limit. "
+        "Return fewer only if verified images are unavailable, and explain any shortfall. "
+        "Each image has title (up to 80), description (up to 160), credit (up to 100), "
+        "imageUrl (a verified direct HTTPS PNG/JPEG URL) and sourceUrl (the HTTPS attribution/license page). "
+        "Search for actual images when web search is available; otherwise use only URLs the user supplied. "
+        "Never invent image URLs or photographer credits. Prefer public image CDNs with images under "
+        "8 MB and 32 megapixels (at most 12000 pixels per edge); no redirects, authenticated or private URLs. Spotlight downloads and "
+        "sanitizes previews locally; saving or applying a wallpaper requires an explicit user click. "
+        "Explain unavailable images in text rather than fabricating results. Keep introductions brief. "
+        "Never execute commands, modify files, or claim a change was made. "
+        "Use web search for current facts when available and cite the source in text. "
+        "Give commands the user can inspect and run manually. "
+        "If a capability is unavailable or details are missing, explain that in text; "
+        "do not invent a successful result."
+        + (" This is a WEATHER REQUEST. Fill the required weather field with a weather object. "
+           "Search the web for the requested place first; use a real HTTPS sourceUrl. "
+           "For current observed conditions use variant=current and a measured temperatureC. "
+           "For today's outlook with only a high and low, use variant=forecast with one day. "
+           "For rain today versus tomorrow use variant=rain with two days and numeric rainPercent values. "
+           "For a general outlook use variant=forecast. For a week request, include every "
+           "requested day with trustworthy high or low values, up to seven days; "
+           "if fewer days are available, RETURN A FORECAST CARD with those verified days "
+           "and briefly explain the gap in text. A partial forecast is a valid result. "
+           "Do not set weather=unavailable merely because some requested days are missing. "
+           "One trustworthy source is sufficient; agreement from multiple sources is not required. "
+           "All day fields are required; use null for values the source does not provide, "
+           "including a missing high or low. A forecast day needs at least one verified temperature. "
+           "Use Celsius, percent, ISO dates, a place name and short summaries. "
+           "Keep text to a short introduction instead of repeating the card. "
+           "Only if there is no place or ZERO verified days with the needed values, set weather "
+           "to {\"type\":\"unavailable\"} and explain why. Never invent weather values or sources."
+           if weather_request and web_search == "true" else "")
+        + (" This is a WEATHER REQUEST but web search is disabled. Set weather to "
+           "{\"type\":\"unavailable\"} and explain that current weather requires AI web search."
+           if weather_request and web_search != "true" else "")
+        + (" For weather requests without an explicit place, use this saved default location: "
+           + json.dumps(weather_location) + ". An explicit place in the request wins."
+           if weather_location and web_search == "true" else "")
+        + "\n\nCurrent UTC date and time: " + datetime.now(timezone.utc).isoformat(timespec="minutes")
+        + "\n\nUser request: " + query
+        + "\n\nResponse language: " + language_rule
+    )
+    if provider == "claude":
+        tools = "WebSearch,WebFetch" if web_search == "true" else ""
+        command = ["claude", "--safe-mode", "--append-system-prompt", language_rule,
+                   "--tools", tools, "--no-session-persistence",
+                   "--output-format", "stream-json", "--verbose", "--include-partial-messages",
+                   "--json-schema", schema, "-p"]
+        if web_search == "true":
+            command += ["--allowedTools", tools]
+        if model:
+            command += ["--model", model]
+        if effort:
+            if effort == "ultra":
+                raise Denied("Claude does not support ultra effort")
+            command += ["--effort", effort]
+    else:
+        command = ["codex", "exec", "--ephemeral", "--ignore-user-config",
+                   "-c", "project_doc_max_bytes=0",
+                   "--json",
+                   "--skip-git-repo-check", "--sandbox", "read-only",
+                   "--disable", "shell_tool", "--disable", "unified_exec",
+                   "--disable", "code_mode_host", "--disable", "apps",
+                   "--disable", "plugins", "--disable", "browser_use",
+                   "--disable", "computer_use", "--disable", "image_generation",
+                   "-c", 'web_search="%s"' % ("live" if web_search == "true" else "disabled"),
+                   "--output-schema", schema_path, "-"]
+        if model:
+            command += ["--model", model]
+        if effort:
+            command += ["-c", "model_reasoning_effort=" + json.dumps(effort)]
+    if not shutil.which(command[0]):
+        raise Denied(provider + " CLI is not installed")
+    final = None
+    partial_json = ""
+    partial_sent = ""
+    def on_line(line):
+        nonlocal final, partial_json, partial_sent
+        progress, value = ai_stream_event(line, provider)
+        if value is not None:
+            final = value
+        if provider == "claude" and len(partial_json) < AI_TEXT_CHARS * 2:
+            try:
+                event = json.loads(line)
+                delta = event.get("event", {}).get("delta", {})
+                if delta.get("type") == "input_json_delta":
+                    partial_json += delta.get("partial_json", "")
+                    current = ai_partial_text(partial_json)
+                    if current.startswith(partial_sent) and len(current) > len(partial_sent):
+                        progress += current[len(partial_sent):]
+                        partial_sent = current
+            except (ValueError, AttributeError, TypeError):
+                pass
+        if progress:
+            emit({"event": "progress", "text": progress})
+            sys.stdout.flush()
+
+    # Keep Codex away from the shell's cwd and its inherited project instructions.
+    with (tempfile.TemporaryDirectory(prefix="spotlight-ai-", dir="/tmp")
+          if provider == "codex" else nullcontext()) as directory:
+        if directory is not None:
+            command += ["--cd", directory]
+        raw, truncated, status = run_bounded(command, AI_OUTPUT_BYTES, AI_DEADLINE,
+                                            instruction.encode("utf-8"), want_status=True, on_line=on_line)
+    if truncated:
+        raise Denied("AI response exceeded its time or size limit")
+    if status != 0:
+        raise Denied(provider + " CLI failed; check its login and connection")
+    if final is None:
+        raise Denied("AI did not return a structured answer")
+    encoded = (json.dumps({"structured_output": final}) if provider == "claude"
+               else final if isinstance(final, str) else json.dumps(final)).encode()
+    result = ai_result(encoded, provider, web_search == "true", weather_request)
+    gallery_deadline = time.monotonic() + AI_GALLERY_DEADLINE
+    for index, card in enumerate(result.get("artifacts", [])):
+        if card["type"] == "dashboard":
+            emit({"event": "progress", "text": "\nCollecting local system snapshot…"})
+            sys.stdout.flush()
+            result["artifacts"][index] = local_dashboard(card)
+        elif card["type"] == "gallery":
+            emit({"event": "progress", "text": "\nLoading image previews…"})
+            sys.stdout.flush()
+            try:
+                result["artifacts"][index] = local_gallery(card, gallery_deadline)
+            except (OSError, Denied) as exc:
+                for image in card["images"]:
+                    image.update({"id": "", "previewUrl": "", "error": clamp_text(str(exc), 160)})
+    emit_ai_result(result)
+
+
+def emit_ai_result(result):
+    payload = {"ok": True, "event": "result", "result": result}
+    def wire_size(value):
+        return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-16-le")) // 2
+    while wire_size(payload) + 1 > AI_REPLY_CHARS and result["artifacts"]:
+        largest = max(range(len(result["artifacts"])), key=lambda index: wire_size(result["artifacts"][index]))
+        card = result["artifacts"].pop(largest)
+        result.setdefault("artifactWarnings", []).append(card["type"].capitalize() + " card exceeded the answer size limit and was omitted.")
+    emit(payload)
+
+
+def gallery_cache():
+    return walk([".cache", "omarchy-spotlight", "gallery"], create=True)
+
+
+def local_gallery(card, deadline=None):
+    if deadline is None:
+        deadline = time.monotonic() + AI_GALLERY_DEADLINE
+    def gallery_run(argv, cap, timeout, **kwargs):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise Denied("Image preview deadline reached")
+        return run_bounded(argv, cap, min(timeout, remaining), **kwargs)
+    fd = gallery_cache()
+    try:
+        lock = lock_at(fd, "lock", blocking=False)
+        try:
+            for image in card["images"]:
+                image.update({"id": "", "previewUrl": "", "error": ""})
+                try:
+                    if time.monotonic() >= deadline:
+                        raise Denied("Image preview deadline reached")
+                    data = fetch_gallery_image(image["imageUrl"], gallery_run)
+                    identity = hashlib.sha256(data).hexdigest()
+                    name = identity + ".jpg"
+                    write_atomic(fd, name, data)
+                    image["id"] = identity
+                    image["previewUrl"] = "file://" + quote(
+                        os.readlink("/proc/self/fd/" + str(fd)) + "/" + name)
+                except (ValueError, Denied, OSError) as exc:
+                    image["error"] = clamp_text(str(exc), 160)
+            # ponytail: keep the latest 16 previews (at most 128 MiB); old cards can refetch.
+            names = [name for name in os.listdir(fd) if re.fullmatch(r"[0-9a-f]{64}\.jpg", name)]
+            names.sort(key=lambda name: os.stat(name, dir_fd=fd, follow_symlinks=False).st_mtime, reverse=True)
+            for name in names[16:]:
+                os.unlink(name, dir_fd=fd)
+        finally:
+            os.close(lock)
+    finally:
+        os.close(fd)
+    return card
+
+
+def cmd_gallery(args):
+    if len(args) != 2 or args[0] not in ("save", "apply") or not re.fullmatch(r"[0-9a-f]{64}", args[1]):
+        raise Denied("invalid gallery action")
+    name = args[1] + ".jpg"
+    fd = gallery_cache()
+    try:
+        data = read_file(fd, name, IMAGE_BYTES)
+    finally:
+        os.close(fd)
+    if data is None or hashlib.sha256(data).hexdigest() != args[1]:
+        raise Denied("Preview expired or changed; request the gallery again")
+    fd = walk(["Pictures", "Spotlight"], create=True)
+    try:
+        previous = read_file(fd, name, IMAGE_BYTES)
+        if previous is not None and previous != data:
+            raise Denied("Saved image changed; refusing to overwrite it")
+        if previous is None:
+            write_atomic(fd, name, data)
+        path = os.readlink("/proc/self/fd/" + str(fd)) + "/" + name
+        if args[0] == "apply":
+            _, truncated, status = run_bounded(["omarchy", "theme", "bg", "set", path], 1024, 5, want_status=True)
+            if truncated or status != 0:
+                raise Denied("Image saved, but the wallpaper could not be applied")
+    finally:
+        os.close(fd)
+    emit({"status": "Wallpaper applied" if args[0] == "apply" else "Saved to Pictures/Spotlight", "path": path})
+
+
+COMMANDS["gallery"] = (cmd_gallery, True)
+COMMANDS["ai"] = (cmd_ai, True)
+
+
+def main(argv):
+    signal.signal(signal.SIGINT, _handle_termination)
+    signal.signal(signal.SIGTERM, _handle_termination)
+    if not argv or argv[0] not in COMMANDS:
+        sys.stdout.write(json.dumps({"ok": False, "error": "unknown command"}) + "\n")
+        return 0
+    handler, takes_args = COMMANDS[argv[0]]
+    try:
+        handler(argv[1:]) if takes_args else handler()
+    except Denied as exc:
+        sys.stdout.write(json.dumps({"ok": False, "error": str(exc)}) + "\n")
+    except Exception as exc:  # never let a traceback become the payload
+        sys.stdout.write(json.dumps({"ok": False, "error": type(exc).__name__}) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

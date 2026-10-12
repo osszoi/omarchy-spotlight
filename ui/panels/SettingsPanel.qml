@@ -1,0 +1,617 @@
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
+import qs.Commons
+import "../components"
+import "../../lib/Web.js" as Web
+
+// Spotlight.qml owns persistence; draft keeps controls responsive during writes.
+FocusScope {
+  id: panel
+
+  // in
+  property color foreground: Color.foreground
+  property color accent: Color.accent
+  property string fontFamily: Style.font.family
+  property color surface: "transparent"
+  property color surfaceBorder: "transparent"
+  property color sheen: "transparent"
+  property int hairline: 1
+  property int surfaceRadius: 12
+  property int rowRadius: 8
+  property var settings: ({})
+  property var aiModels: ({ claude: [], codex: [] })
+  property var pendingSettings: ({})
+  property bool saveFailed: false
+  property string saveError: ""
+  property string currentBinding: ""
+  property real availableHeight: Style.space(720)
+
+  // owned
+  // Spotlight.qml normalizes settings; queued patches only hold values these
+  // controls or the tour produced.
+  readonly property var draft: Object.assign({}, panel.settings, panel.pendingSettings)
+  // Reset requires two presses.
+  property bool resetArmed: false
+  // Set by Spotlight.qml once the helper confirms the reset.
+  property bool resetDone: false
+  property string activeTab: "general"
+
+  // out
+  signal changed(var patch)
+  signal action(string name)
+  signal closed()
+
+  readonly property SpotlightPalette chrome: SpotlightPalette {
+    foreground: panel.foreground
+    accent: panel.accent
+    fontFamily: panel.fontFamily
+    hairline: panel.hairline
+    rowRadius: panel.rowRadius
+  }
+
+  readonly property color dim: chrome.dim
+
+  function open() {
+    currencyCodeField.revert()
+    panel.activeTab = "general"
+    panel.resetArmed = false
+    panel.resetDone = false
+    // After the layout has settled: the rows are still being sized when open()
+    // runs, and a contentY set against the old height does not survive it.
+    Qt.callLater(function() { flick.contentY = 0 })
+    focusPanel()
+  }
+
+  function set(key, value) {
+    var patch = ({})
+    patch[key] = value
+    panel.changed(patch)
+  }
+
+  function toggle(key) { panel.set(key, panel.draft[key] !== true) }
+
+  function showTab(tab) {
+    if (panel.activeTab === "ai") artifactSettingsPage.commit()
+    panel.activeTab = tab
+    Qt.callLater(function() { flick.contentY = 0 })
+    focusPanel()
+  }
+
+  function focusPanel() {
+    Qt.callLater(function() {
+      if (panel.visible) focusHome.forceActiveFocus()
+    })
+  }
+
+  // Tab walks the rows; a row below the fold has to come into view or the focus
+  // ring lands somewhere the user cannot see. Whatever holds focus inside a row
+  // scrolls that whole row in.
+  readonly property Item focusedItem: Window.activeFocusItem
+  onFocusedItemChanged: {
+    for (var item = panel.focusedItem; item; item = item.parent)
+      if (item.parent === content || typeof item.switchable === "boolean") {
+        panel.ensureVisible(item)
+        break
+      }
+  }
+
+  function ensureVisible(item) {
+    if (!item || !flick.visible) return
+    var top = item.mapToItem(content, 0, 0).y
+    var bottom = top + item.height
+    if (top < flick.contentY) flick.contentY = Math.max(0, top - Style.space(8))
+    else if (bottom > flick.contentY + flick.height)
+      flick.contentY = Math.min(Math.max(0, content.height - flick.height),
+                                bottom - flick.height + Style.space(8))
+  }
+
+  // Every exit goes through here. A rejected currency code is still sitting in
+  // the field at that point, and nothing was written for it, so the field is
+  // put back on the stored value instead of leaving the two disagreeing.
+  function finish() {
+    if (panel.activeTab === "ai") artifactSettingsPage.commit()
+    currencyCodeField.revert()
+    panel.closed()
+  }
+
+  // Esc is the only key that closes the panel. Return belongs to whatever holds
+  // focus, and a panel that closed on a stray Enter from a stepper or a menu
+  // would swallow the edit the user was in the middle of.
+  Keys.onPressed: function(event) {
+    if (event.key === Qt.Key_Escape) {
+      panel.finish()
+      event.accepted = true
+    }
+  }
+
+  // ------------------------------------------------------------- pieces
+  component GroupLabel: Text {
+    Layout.fillWidth: true
+    Layout.topMargin: Style.space(6)
+    color: panel.dim
+    font.family: panel.fontFamily
+    font.pixelSize: Style.font.caption
+    font.bold: true
+  }
+
+  // ------------------------------------------------------------- surface
+  width: Math.min(Style.space(620), (parent ? parent.width : Style.space(800)) - Style.space(48))
+  height: panel.availableHeight
+
+  // Where focus goes on open. The scope itself would hand it back to the
+  // control focused last time, scroll to it and let a stray Space press it.
+  Item { id: focusHome }
+
+  Rectangle {
+    anchors.fill: parent
+    radius: panel.surfaceRadius
+    color: panel.surface
+    border.width: panel.hairline
+    border.color: panel.surfaceBorder
+    antialiasing: true
+
+    // Swallow clicks so they don't reach the dismiss MouseArea behind.
+    MouseArea { anchors.fill: parent; onClicked: {} }
+
+    Rectangle {
+      anchors { top: parent.top; left: parent.left; right: parent.right }
+      anchors.topMargin: panel.hairline
+      anchors.leftMargin: panel.surfaceRadius
+      anchors.rightMargin: panel.surfaceRadius
+      height: panel.hairline
+      color: panel.sheen
+      radius: height
+    }
+  }
+
+  ColumnLayout {
+    id: column
+    anchors.fill: parent
+    anchors.margins: Style.space(24)
+    spacing: Style.space(14)
+
+    RowLayout {
+      Layout.fillWidth: true
+      spacing: Style.space(12)
+
+      IconTile {
+        chrome: panel.chrome
+        glyph: "󰒓"
+      }
+
+      ColumnLayout {
+        Layout.fillWidth: true
+        spacing: Style.space(2)
+
+        Text {
+          Layout.fillWidth: true
+          text: "Spotlight Settings"
+          color: panel.foreground
+          font.family: panel.fontFamily
+          font.pixelSize: Style.font.title
+          font.bold: true
+        }
+
+        Text {
+          Layout.fillWidth: true
+          text: panel.saveFailed
+            ? "Settings not saved: " + (panel.saveError || "Check the file") + ". Retry after fixing it."
+            : "Changes save as you make them."
+          textFormat: Text.PlainText
+          elide: Text.ElideRight
+          color: panel.saveFailed ? Color.urgent : panel.dim
+          font.family: panel.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+      }
+
+      TextButton {
+        visible: panel.saveFailed
+        chrome: panel.chrome
+        text: "Retry save"
+        onClicked: panel.action("retry")
+      }
+
+      TextButton {
+        chrome: panel.chrome
+        text: "Edit file"
+        onClicked: panel.action("edit")
+      }
+    }
+
+    RowLayout {
+      Layout.fillWidth: true
+      spacing: Style.space(8)
+
+      Pill {
+        chrome: panel.chrome
+        text: "General"
+        selected: panel.activeTab === "general"
+        onClicked: panel.showTab("general")
+      }
+
+      Pill {
+        chrome: panel.chrome
+        text: "Search"
+        selected: panel.activeTab === "search"
+        onClicked: panel.showTab("search")
+      }
+
+      Pill {
+        chrome: panel.chrome
+        text: "Appearance"
+        selected: panel.activeTab === "appearance"
+        onClicked: panel.showTab("appearance")
+      }
+
+      Pill {
+        chrome: panel.chrome
+        text: "AI"
+        selected: panel.activeTab === "ai"
+        onClicked: panel.showTab("ai")
+      }
+
+      Item { Layout.fillWidth: true }
+    }
+
+    Flickable {
+      id: flick
+      Layout.fillWidth: true
+      Layout.fillHeight: true
+      Layout.preferredHeight: content.implicitHeight
+      contentWidth: width
+      contentHeight: content.implicitHeight
+      clip: true
+      boundsBehavior: Flickable.StopAtBounds
+
+      ScrollBar.vertical: ScrollBar {
+        policy: flick.contentHeight > flick.height ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
+      }
+
+      ColumnLayout {
+        id: content
+        width: flick.width - (flick.contentHeight > flick.height ? Style.space(10) : 0)
+        spacing: Style.space(10)
+
+        GroupLabel { text: "APPEARANCE"; visible: panel.activeTab === "appearance" }
+
+        SettingRow {
+          visible: panel.activeTab === "appearance"
+          chrome: panel.chrome
+          glyph: "󰕴"
+          switchable: false
+          title: "Vertical position"
+          description: "0% is the top, 50% is the default, 100% is the bottom. Results grow downward; small screens limit movement."
+
+          trailing: Stepper {
+            chrome: panel.chrome
+            value: panel.draft.verticalPosition
+            from: 0
+            to: 100
+            step: 5
+            onChanged: function(v) { panel.set("verticalPosition", v) }
+          }
+        }
+
+        SettingRow {
+          visible: panel.activeTab === "appearance"
+          chrome: panel.chrome
+          glyph: "󰁂"
+          switchable: false
+          title: "Horizontal position"
+          description: "0% is the left, 50% is the center, 100% is the right. Narrow screens limit movement."
+
+          trailing: Stepper {
+            chrome: panel.chrome
+            value: panel.draft.horizontalPosition
+            from: 0
+            to: 100
+            step: 5
+            onChanged: function(v) { panel.set("horizontalPosition", v) }
+          }
+        }
+
+        SettingRow {
+          visible: panel.activeTab === "appearance"
+          chrome: panel.chrome
+          glyph: "󰕮"
+          title: "Preview pane"
+          description: "Show details for the selected result beside the list: conversions, file contents, clipboard entries and more."
+          checked: panel.draft.previewPane === true
+          onToggled: panel.toggle("previewPane")
+        }
+
+        SettingRow {
+          visible: panel.activeTab === "appearance"
+          chrome: panel.chrome
+          glyph: "󰔎"
+          title: "Reduce motion"
+          description: "Skip Spotlight's opening, closing and resizing animations."
+          checked: panel.draft.reduceMotion === true
+          onToggled: panel.toggle("reduceMotion")
+        }
+
+        GroupLabel { text: "SOURCES"; visible: panel.activeTab === "search" }
+
+        SettingRow {
+          visible: panel.activeTab === "search"
+          chrome: panel.chrome
+          glyph: "󰉋"
+          title: "Files and folders"
+          description: "Find files in your home directory by name."
+          checked: panel.draft.fileSearch === true
+          onToggled: panel.toggle("fileSearch")
+
+          SubToggle {
+            chrome: panel.chrome
+            enabled: panel.draft.fileSearch === true
+            text: "Include files in every search"
+            description: "When off, files only appear after you type f, f: or a path."
+            checked: panel.draft.fileSearchAlways === true
+            onToggled: panel.toggle("fileSearchAlways")
+          }
+        }
+
+        SettingRow {
+          visible: panel.activeTab === "search"
+          chrome: panel.chrome
+          glyph: "󰅌"
+          title: "Clipboard history"
+          description: "Search what you copied earlier and copy it again with Enter."
+          checked: panel.draft.clipboardSearch === true
+          onToggled: panel.toggle("clipboardSearch")
+
+          SubToggle {
+            chrome: panel.chrome
+            enabled: panel.draft.clipboardSearch === true
+            text: "Include clipboard in every search"
+            description: "When off, clipboard entries only appear after you type cb, cb: or clip."
+            checked: panel.draft.clipboardSearchAlways === true
+            onToggled: panel.toggle("clipboardSearchAlways")
+          }
+        }
+
+        SettingRow {
+          visible: panel.activeTab === "search"
+          chrome: panel.chrome
+          glyph: "󰧐"
+          title: "Learn from your choices"
+          description: "Results you pick often move up over time. Nothing leaves this machine."
+          checked: panel.draft.learningEnabled === true
+          onToggled: panel.toggle("learningEnabled")
+        }
+
+        GroupLabel { text: "WEB"; visible: panel.activeTab === "search" }
+
+        SettingRow {
+          visible: panel.activeTab === "search"
+          chrome: panel.chrome
+          glyph: "󱐋"
+          title: "Search suggestions"
+          description: "Complete your query while you type. Queries are sent to "
+            + (panel.draft.searchEngine === "kagi" ? "Kagi" : "Google")
+            + ", so this is off by default."
+          checked: panel.draft.webSuggestions === true
+          onToggled: panel.toggle("webSuggestions")
+        }
+
+        SettingRow {
+          visible: panel.activeTab === "search"
+          chrome: panel.chrome
+          glyph: "󱐋"
+          switchable: false
+          title: "Search suggestions shown"
+          description: "How many suggestions the web provider may add. Zero hides them."
+
+          trailing: Stepper {
+            chrome: panel.chrome
+            value: panel.draft.maxSuggestions
+            from: 0
+            to: 8
+            onChanged: function(v) { panel.set("maxSuggestions", v) }
+          }
+        }
+
+        SettingRow {
+          visible: panel.activeTab === "search"
+          chrome: panel.chrome
+          glyph: "󰖟"
+          switchable: false
+          title: "Web search engine"
+          description: "Where the web search result opens when you press Enter, and which provider answers search suggestions."
+
+          trailing: ChoiceMenu {
+            chrome: panel.chrome
+            bounds: panel
+            value: panel.draft.searchEngine
+            options: Web.engineOptions()
+            onChanged: function(v) { panel.set("searchEngine", v) }
+          }
+        }
+
+        GroupLabel { text: "AI"; visible: panel.activeTab === "ai" }
+
+        AiSettings {
+          visible: panel.activeTab === "ai"
+          Layout.fillWidth: true
+          chrome: panel.chrome
+          bounds: panel
+          draft: panel.draft
+          aiModels: panel.aiModels
+          onChanged: function(patch) { panel.changed(patch) }
+        }
+
+        GroupLabel { text: "ARTIFACTS"; visible: panel.activeTab === "ai" }
+
+        ArtifactSettingsPage {
+          id: artifactSettingsPage
+          visible: panel.activeTab === "ai"
+          Layout.fillWidth: true
+          chrome: panel.chrome
+          artifactSettings: panel.draft.artifactSettings || ({ weather: { defaultLocation: "" } })
+          onChanged: function(patch) { panel.changed(patch) }
+        }
+
+        GroupLabel { text: "CURRENCY"; visible: panel.activeTab === "search" }
+
+        SettingRow {
+          visible: panel.activeTab === "search"
+          chrome: panel.chrome
+          glyph: "󰑤"
+          title: "Currency rates"
+          description: "Fetch rates from Frankfurter for complete currency queries."
+          checked: panel.draft.currencyRates !== false
+          onToggled: panel.toggle("currencyRates")
+        }
+
+        SettingRow {
+          visible: panel.activeTab === "search"
+          chrome: panel.chrome
+          glyph: "󰠓"
+          switchable: false
+          title: "Default currency"
+          description: currencyCodeField.valid
+            ? "Type a 3-letter currency code, or leave blank. Explicit targets take priority."
+            : "Enter a supported 3-letter currency code, or clear the field."
+
+          trailing: CurrencyField {
+            id: currencyCodeField
+            chrome: panel.chrome
+            implicitWidth: Style.space(160)
+            code: panel.draft.defaultCurrency || ""
+            onPicked: function(code) { panel.set("defaultCurrency", code) }
+          }
+        }
+
+        GroupLabel { text: "RESULTS"; visible: panel.activeTab === "search" }
+
+        SettingRow {
+          visible: panel.activeTab === "search"
+          chrome: panel.chrome
+          glyph: "󰒺"
+          switchable: false
+          title: "Results shown"
+          description: "How many rows the list holds before it stops adding more."
+
+          trailing: Stepper {
+            chrome: panel.chrome
+            value: panel.draft.maxResults
+            from: 8
+            to: 50
+            onChanged: function(v) { panel.set("maxResults", v) }
+          }
+        }
+
+        SettingRow {
+          visible: panel.activeTab === "search"
+          chrome: panel.chrome
+          glyph: "󰀻"
+          switchable: false
+          title: "Applications shown"
+          description: "How many application matches a query can contribute."
+
+          trailing: Stepper {
+            chrome: panel.chrome
+            value: panel.draft.maxApps
+            from: 3
+            to: 24
+            onChanged: function(v) { panel.set("maxApps", v) }
+          }
+        }
+
+        GroupLabel { text: "SHORTCUT"; visible: panel.activeTab === "general" }
+
+        SettingRow {
+          visible: panel.activeTab === "general"
+          chrome: panel.chrome
+          glyph: "󰌌"
+          switchable: false
+          title: "Open Spotlight"
+          description: panel.currentBinding !== ""
+            ? "The shortcut that opens this launcher from anywhere."
+            : "No shortcut is set yet. Pick one to open Spotlight from anywhere."
+
+          trailing: RowLayout {
+            spacing: Style.space(10)
+
+            ChordCaps {
+              chrome: panel.chrome
+              chord: panel.currentBinding
+              small: true
+              emptyText: "None"
+            }
+
+            Pill {
+              chrome: panel.chrome
+              text: "Change"
+              onClicked: panel.action("shortcut")
+            }
+          }
+        }
+
+        GroupLabel { text: "MAINTENANCE"; visible: panel.activeTab === "general" }
+
+        SettingRow {
+          visible: panel.activeTab === "general"
+          chrome: panel.chrome
+          glyph: "󰑐"
+          switchable: false
+          title: "Setup and data"
+          description: "Run the tour again, open the folder holding the learning data, or clear that data."
+
+          RowLayout {
+            Layout.fillWidth: true
+            spacing: Style.space(8)
+
+            Pill {
+              chrome: panel.chrome
+              text: "Run setup tour"
+              onClicked: panel.action("tour")
+            }
+
+            Pill {
+              chrome: panel.chrome
+              text: "Data folder"
+              onClicked: panel.action("data")
+            }
+
+            Pill {
+              chrome: panel.chrome
+              text: panel.resetArmed ? "Press again to reset"
+                : panel.resetDone ? "Learning data cleared" : "Reset learning data"
+              selected: panel.resetArmed
+              onClicked: {
+                if (!panel.resetArmed) { panel.resetArmed = true; panel.resetDone = false; return }
+                panel.resetArmed = false
+                panel.action("reset")
+              }
+            }
+
+            Item { Layout.fillWidth: true }
+          }
+        }
+      }
+    }
+
+    RowLayout {
+      Layout.fillWidth: true
+      spacing: Style.space(12)
+
+      Text {
+        Layout.fillWidth: true
+        text: "Esc closes"
+        color: panel.dim
+        font.family: panel.fontFamily
+        font.pixelSize: Style.font.caption
+      }
+
+      PrimaryButton {
+        chrome: panel.chrome
+        text: "Done"
+        glyph: "󰄬"
+        onClicked: panel.finish()
+      }
+    }
+  }
+}
