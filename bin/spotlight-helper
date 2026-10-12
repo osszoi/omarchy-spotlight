@@ -139,6 +139,18 @@ DOCKER_DEADLINE = 3.0
 DOCKER_COUNT = 200
 DOCKER_ID_RE = re.compile(r"^[0-9a-f]{12,64}$")
 
+GH_BYTES = 2 * 1024 * 1024
+GH_DEADLINE = 15.0
+GH_REPO_COUNT = 1000
+GH_PR_COUNT = 300
+GH_LOGIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}$")
+GH_REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}$")
+GH_REPOS_ARGV = ["gh", "api", "--paginate",
+                 "/user/repos?per_page=100&affiliation=owner,organization_member&sort=pushed",
+                 "--jq", ".[] | {name: .full_name, description, private, archived, pushed: .pushed_at}"]
+GH_OWNERS_ARGV = ["gh", "api", "graphql", "-f", "query={viewer{login organizations(first:100){nodes{login}}}}",
+                  "--jq", "[.data.viewer.login] + [.data.viewer.organizations.nodes[].login] | .[]"]
+
 SERVICES_BYTES = 512 * 1024
 SERVICES_DEADLINE = 2.0
 # ponytail: first 200 loaded services only; add paging if hosts exceed this.
@@ -214,6 +226,7 @@ AI_REPLY_CHARS = 524288  # Must match Spotlight.maxHelperPayloadChars (UTF-16 un
 AI_GALLERY_DEADLINE = 10.0
 AI_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,191}$")
 AI_EFFORTS = {"low", "medium", "high", "xhigh", "max", "ultra"}
+MOTION_STYLES = ("soft", "spring", "gentle", "snappy")
 TLDR_PAGE_RE = re.compile(r"^[a-z0-9][a-z0-9._+-]{0,63}$")
 # `{{[-a|--all]}}` is an option alternation; the long form reads best.
 TLDR_OPTION_RE = re.compile(r"\{\{\[[^|\]]*\|([^\]]*)\]\}\}")
@@ -249,6 +262,16 @@ HYPR_MODMASK = ((1, "SHIFT"), (4, "CTRL"), (8, "ALT"), (64, "SUPER"))
 BINDINGS_PRINT_BYTES = 64 * 1024
 BINDINGS_PRINT_DEADLINE = 3.0
 BINDINGS_DESC_CHARS = 120
+# omarchy's toggles dir: hyprland requires every *.lua in it on each reload
+BLUR_DIR = [".local", "state", "omarchy", "toggles", "hypr"]
+BLUR_FILE = "spotlight-blur.lua"
+# layers only blur with global blur on, hence no_blur on windows. ignore_alpha
+# skips the 0.25 scrim so only the card (>= 0.4) gets frosted
+BLUR_LUA = """-- written by eduardo.spotlight (Settings > Appearance > Blur), delete it and reload hyprland to undo
+hl.config({ decoration = { blur = { enabled = true, size = %d, passes = %d } } })
+hl.window_rule({ match = { class = ".*" }, no_blur = true })
+hl.layer_rule({ match = { namespace = "omarchy-spotlight" }, blur = true, ignore_alpha = 0.3 })
+"""
 MARK_START = '-- >>> spotlight setup tour (managed; rerun via "Run Setup Tour") >>>'
 MARK_END = "-- <<< spotlight setup tour <<<"
 DISABLED_PREFIX = "-- spotlight-tour:disabled "
@@ -807,6 +830,14 @@ def normalize_settings(parsed):
         "maxSuggestions": 4,
         "verticalPosition": 50,
         "horizontalPosition": 50,
+        "cardOpacity": 92,
+        "blur": False,
+        "blurStrength": 4,
+        "keepQuerySeconds": 5,
+        "keepQueryForever": False,
+        "compactStart": True,
+        "motionStyle": "soft",
+        "motionDuration": 320,
         "setupCompleted": False,
     }
     if not isinstance(parsed, dict):
@@ -820,6 +851,11 @@ def normalize_settings(parsed):
     out["clipboardSearchAlways"] = clamp_bool(parsed.get("clipboardSearchAlways"), True)
     out["previewPane"] = clamp_bool(parsed.get("previewPane"), True)
     out["reduceMotion"] = clamp_bool(parsed.get("reduceMotion"), False)
+    out["blur"] = clamp_bool(parsed.get("blur"), False)
+    out["keepQueryForever"] = clamp_bool(parsed.get("keepQueryForever"), False)
+    out["compactStart"] = clamp_bool(parsed.get("compactStart"), True)
+    if parsed.get("motionStyle") in MOTION_STYLES:
+        out["motionStyle"] = parsed["motionStyle"]
     out["learningEnabled"] = clamp_bool(parsed.get("learningEnabled"), True)
     out["aiEnabled"] = clamp_bool(parsed.get("aiEnabled"), False)
     out["aiWebSearch"] = clamp_bool(parsed.get("aiWebSearch"), False)
@@ -839,6 +875,11 @@ def normalize_settings(parsed):
     out["maxResults"] = clamp_int(parsed.get("maxResults"), 8, 50, 20)
     out["maxApps"] = clamp_int(parsed.get("maxApps"), 3, 24, 8)
     out["maxSuggestions"] = clamp_int(parsed.get("maxSuggestions"), 0, SUGGEST_COUNT, 4)
+    for key, low, high in (("cardOpacity", 40, 100), ("blurStrength", 1, 10),
+                       ("keepQuerySeconds", 0, 300), ("motionDuration", 60, 1000)):
+        value = parsed.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            out[key] = clamp_int(value, low, high, out[key])
     for key in ("verticalPosition", "horizontalPosition"):
         position = parsed.get(key)
         if isinstance(position, int) and not isinstance(position, bool):
@@ -2643,6 +2684,77 @@ def cmd_docker():
           "partial": truncated or len(rows) > DOCKER_COUNT})
 
 
+def one_line(value, chars):
+    return " ".join(clamp_text(value, chars).split())
+
+
+def cmd_gh_repos():
+    raw, truncated = view_output(GH_REPOS_ARGV, GH_BYTES, GH_DEADLINE,
+                                 "GitHub CLI unavailable", allow_partial=True)
+    rows = []
+    for line in raw.decode("utf-8", "replace").splitlines():
+        try:
+            item = json.loads(line)
+        except ValueError:
+            raise Denied("invalid GitHub output")
+        if not isinstance(item, dict):
+            raise Denied("invalid GitHub output")
+        name = item.get("name")
+        if not isinstance(name, str) or not GH_REPO_RE.fullmatch(name):
+            continue
+        rows.append({
+            "name": name,
+            "description": one_line(item.get("description"), 200),
+            "private": item.get("private") is True,
+            "archived": item.get("archived") is True,
+            # built from the checked name, never taken from the reply
+            "url": "https://github.com/" + name,
+            "pushed": clamp_text(item.get("pushed"), 32),
+        })
+    rows.sort(key=lambda row: row["pushed"], reverse=True)
+    emit({"repos": rows[:GH_REPO_COUNT], "partial": truncated or len(rows) > GH_REPO_COUNT})
+
+
+def cmd_gh_prs():
+    raw, _ = view_output(GH_OWNERS_ARGV, GH_BYTES, GH_DEADLINE, "GitHub CLI unavailable")
+    owners = [o for o in raw.decode("utf-8", "replace").split() if GH_LOGIN_RE.fullmatch(o)][:20]
+    if not owners:
+        raise Denied("GitHub CLI unavailable")
+    raw, _ = view_output(
+        ["gh", "search", "prs", "--state=open", "--archived=false", "--sort=updated", "--order=desc",
+         "--limit=%d" % (GH_PR_COUNT + 1), "--json=number,title,repository,author,url,updatedAt,isDraft"]
+        + ["--owner=" + owner for owner in owners],
+        GH_BYTES, GH_DEADLINE, "GitHub CLI unavailable")
+    try:
+        items = json.loads(raw)
+    except ValueError:
+        raise Denied("invalid GitHub output")
+    if not isinstance(items, list):
+        raise Denied("invalid GitHub output")
+    rows = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        repo = item.get("repository")
+        repo = repo.get("nameWithOwner") if isinstance(repo, dict) else None
+        number = item.get("number")
+        if (not isinstance(repo, str) or not GH_REPO_RE.fullmatch(repo)
+                or not isinstance(number, int) or isinstance(number, bool) or number < 1):
+            continue
+        author = item.get("author")
+        rows.append({
+            "repo": repo,
+            "number": number,
+            "title": one_line(item.get("title"), 300),
+            "author": one_line(author.get("login") if isinstance(author, dict) else "", 64),
+            "url": "https://github.com/%s/pull/%d" % (repo, number),
+            "updated": clamp_text(item.get("updatedAt"), 32),
+            "draft": item.get("isDraft") is True,
+        })
+    rows.sort(key=lambda row: row["updated"], reverse=True)
+    emit({"prs": rows[:GH_PR_COUNT], "partial": len(rows) > GH_PR_COUNT})
+
+
 def service_snapshot():
     rows = []
     scopes = []
@@ -3417,6 +3529,48 @@ def cmd_write_binding(argv):
           "path": os.path.join(os.environ["HOME"], ".config", "hypr", "bindings.lua")})
 
 
+def _hypr_config_errors():
+    raw = _hypr_request(b"j/configerrors")
+    try:
+        errors = json.loads(raw.decode("utf-8")) if raw else []
+    except (ValueError, UnicodeDecodeError):
+        return set()
+    if not isinstance(errors, list):
+        return set()
+    return {e for e in errors if isinstance(e, str) and e.strip()}
+
+
+def cmd_write_blur(argv):
+    if argv == ["off"]:
+        payload = None
+    elif len(argv) == 2 and argv[0] == "on" and argv[1].isdigit():
+        strength = clamp_int(argv[1], 1, 10, 4)
+        passes = 1 if strength <= 4 else 2 if strength <= 7 else 3
+        payload = (BLUR_LUA % (strength * 2, passes)).encode("utf-8")
+    else:
+        raise Denied("bad blur arguments")
+    before = _hypr_config_errors()
+    fd = walk(BLUR_DIR, create=True)
+    try:
+        if payload is None:
+            try:
+                os.unlink(BLUR_FILE, dir_fd=fd)
+            except FileNotFoundError:
+                pass
+        else:
+            write_atomic(fd, BLUR_FILE, payload)
+        reloaded = _hypr_request(b"reload") is not None
+        new_errors = sorted(_hypr_config_errors() - before) if reloaded else []
+        # never leave hyprland broken because of us
+        if new_errors and payload is not None:
+            os.unlink(BLUR_FILE, dir_fd=fd)
+            _hypr_request(b"reload")
+    finally:
+        os.close(fd)
+    emit({"blur": payload is not None and reloaded and not new_errors,
+          "reloaded": reloaded, "errors": [clamp_text(e, 300) for e in new_errors[:3]]})
+
+
 def cmd_revert_binding():
     fd = _hypr_dir()
     try:
@@ -3465,6 +3619,8 @@ COMMANDS = {
     "clipboard-preview": (cmd_clipboard_preview, True),
     "ports": (cmd_ports, False),
     "docker": (cmd_docker, False),
+    "gh-repos": (cmd_gh_repos, False),
+    "gh-prs": (cmd_gh_prs, False),
     "services": (cmd_services, False),
     "mounts": (cmd_mounts, False),
     "audio": (cmd_audio, False),
@@ -3477,6 +3633,7 @@ COMMANDS = {
     "read-binding": (cmd_read_binding, False),
     "write-binding": (cmd_write_binding, True),
     "revert-binding": (cmd_revert_binding, False),
+    "write-blur": (cmd_write_blur, True),
 }
 
 

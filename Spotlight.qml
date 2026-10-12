@@ -24,6 +24,9 @@ import "lib/Ranking.js" as Ranking
 import "lib/Chord.js" as Chord
 import "lib/SettingsQueue.js" as SettingsQueue
 import "lib/WeatherIntent.js" as WeatherIntent
+import "lib/Cheatsheet.js" as Cheatsheet
+import "lib/Resume.js" as Resume
+import "lib/Placeholders.js" as Placeholders
 
 // Spotlight — a Raycast-shaped command palette for Omarchy.
 //
@@ -112,6 +115,11 @@ Item {
     }
   }
   property string query: ""
+  property string placeholder: Placeholders.PHRASES[0]
+  readonly property int motionMs: root.settings.reduceMotion ? 0 : root.settings.motionDuration
+  readonly property int motionEasing: root.settings.motionStyle === "spring" ? Easing.OutBack
+    : root.settings.motionStyle === "gentle" ? Easing.InOutSine
+    : root.settings.motionStyle === "snappy" ? Easing.OutCubic : Easing.OutQuint
   property int selectedIndex: 0
   // The right pane only browses the row selected on the left. Once that row
   // changes (hover, a click, an async rebuild) the listing belongs to nothing
@@ -228,6 +236,12 @@ Item {
   property real aiReadPosition: 0
   property int aiGeneration: 0
   property var aiProcess: null
+  property bool aiSeen: false
+  property real aiFinishedAt: 0
+  property string lastQuery: ""
+  property real lastClosedAt: 0
+  property bool forgetOnClose: false
+  property bool dropAiOnClose: false
 
   // Async provider caches. Each is refreshed by its own Process and triggers a
   // rebuild when it lands, so a slow provider never blocks the fast ones.
@@ -245,6 +259,9 @@ Item {
   property int viewGeneration: 0
   property var viewProcess: null
   property bool viewPartial: false
+  property string viewNote: ""
+  // last good list of the slow views (gh:, pr:), memory only, shown while they refresh
+  property var viewCache: ({})
   property var currencySession: Currency.createSession()
   property var currencyProcess: null
   property var pendingCurrency: null
@@ -343,6 +360,14 @@ Item {
     maxSuggestions: 4,
     verticalPosition: 50,
     horizontalPosition: 50,
+    cardOpacity: 92,
+    blur: false,
+    blurStrength: 4,
+    keepQuerySeconds: 5,
+    keepQueryForever: false,
+    compactStart: true,
+    motionStyle: "soft",
+    motionDuration: 320,
     // true until the helper answers, so the tour never flashes before the
     // first-run flag has actually been read.
     setupCompleted: true
@@ -380,10 +405,8 @@ Item {
   // Hyprland's, applied to this layer's namespace.
   readonly property color foreground: Color.menu.text
   readonly property color accent: Color.accent
-  // Frosted glass needs something left to frost: at 0.86 the card is opaque
-  // and Hyprland's blur has no visible effect. 0.62 keeps text contrast while
-  // letting the blurred wallpaper through as colour and shape.
-  readonly property color glassBackground: Util.alpha(Color.menu.background, 0.62)
+  // omarchy ships with blur off, so upstream's 0.62 glass is just unreadable see-through
+  readonly property color glassBackground: Util.alpha(Color.menu.background, root.settings.cardOpacity / 100)
   readonly property color glassBorder: Util.alpha(Color.foreground, 0.09)
   readonly property color glassSheen: Util.alpha("#ffffff", 0.07)
   readonly property color scrim: Util.alpha(Color.menu.scrim, 0.25)
@@ -436,10 +459,20 @@ Item {
     } catch (e) {
       initial = ""
     }
-    var resumeAi = (!initial || initial === root.aiQuery) && root.aiQuery !== ""
-      && (root.aiBusy || root.aiResult !== null || root.aiError !== "")
+    var restore = Resume.decide({
+      initial: initial, lastQuery: root.lastQuery, closedAt: root.lastClosedAt, now: Date.now(),
+      keepSeconds: root.settings.keepQuerySeconds, keepForever: root.settings.keepQueryForever,
+      aiQuery: root.aiQuery, aiBusy: root.aiBusy, aiSeen: root.aiSeen, aiFinishedAt: root.aiFinishedAt,
+      aiHeld: root.aiQuery !== "" && (root.aiBusy || root.aiResult !== null || root.aiError !== "")
+    })
+    if (restore.dropAi) root.stopAi()
+    var resumeAi = restore.resumeAi
 
     root.opened = true
+    root.forgetOnClose = false
+    var room = Math.min(Style.space(560), panel.width - Style.space(48)) - input.x - root.gutter
+    root.placeholder = Placeholders.pick(root.placeholder,
+      function(p) { return placeholderMetrics.advanceWidth(p) <= room }, Math.random)
     root.tourActive = false
     root.settingsActive = false
     root.tourFromSettings = false
@@ -451,7 +484,7 @@ Item {
     root.refreshPluginCommands()
     // A re-summon reloads the view instead of reusing the last list.
     root.resetView("")
-    input.text = resumeAi ? root.aiQuery : initial
+    input.text = restore.text
     input.cursorPosition = input.text.length
     root.selectedIndex = 0
     root.cursorActive = true
@@ -480,6 +513,7 @@ Item {
     if (resumeAi) {
       aiPanel.restoringScroll = true
       root.aiActive = true
+      if (!root.aiBusy) root.aiSeen = true
       aiPanel.restoreScroll(root.aiReadPosition)
     }
     pointerGate.reset()
@@ -496,6 +530,10 @@ Item {
     // dismiss() closes before asking the shell to hide, and the shell calls
     // close() again; the second call has nothing left to stop.
     if (!root.opened) return
+    root.lastQuery = root.forgetOnClose ? "" : input.text
+    root.lastClosedAt = Date.now()
+    root.dropAiOnClose = root.forgetOnClose && root.aiActive && !root.aiBusy
+    root.forgetOnClose = false
     root.opened = false
     if (root.settingsActive) root.flushSettings()
     if (root.presentationProgress === 0) root.finishClose()
@@ -507,6 +545,8 @@ Item {
     root.armedKey = ""
     root.leaveSettingsPanel()
     root.stopQueryWork()
+    if (root.dropAiOnClose) root.stopAi()
+    root.dropAiOnClose = false
   }
 
   // Search readers belong to the visible query. An explicitly submitted AI
@@ -766,9 +806,12 @@ Item {
   function completeSettingsWrite(raw) {
     var reply = root.helperReply(raw)
     if (reply) {
+      var oldBlur = root.settings.blur + ":" + root.settings.blurStrength
       root.settingsSaveError = ""
       root.settingsReadStale = true
       root.loadSettings(raw)
+      // only on a real change, startup reads must not reload hyprland
+      if (root.settings.blur + ":" + root.settings.blurStrength !== oldBlur) blurSyncDebounce.restart()
     } else {
       root.settingsSaveError = root.helperError(raw)
       if (!root.settingsActive) Util.execArgv(["notify-send", "-u", "critical",
@@ -943,6 +986,19 @@ Item {
         ? Util.clamp(parsed.verticalPosition, 0, 100) : 50,
       horizontalPosition: isFinite(parsed.horizontalPosition)
         ? Util.clamp(parsed.horizontalPosition, 0, 100) : 50,
+      cardOpacity: isFinite(parsed.cardOpacity)
+        ? Util.clamp(parsed.cardOpacity, 40, 100) : 92,
+      blur: parsed.blur === true,
+      blurStrength: isFinite(parsed.blurStrength)
+        ? Util.clamp(parsed.blurStrength, 1, 10) : 4,
+      keepQuerySeconds: isFinite(parsed.keepQuerySeconds)
+        ? Util.clamp(parsed.keepQuerySeconds, 0, 300) : 5,
+      keepQueryForever: parsed.keepQueryForever === true,
+      compactStart: parsed.compactStart !== false,
+      motionStyle: ["soft", "spring", "gentle", "snappy"].indexOf(parsed.motionStyle) >= 0
+        ? parsed.motionStyle : "soft",
+      motionDuration: isFinite(parsed.motionDuration)
+        ? Util.clamp(parsed.motionDuration, 60, 1000) : 320,
       setupCompleted: parsed.setupCompleted !== false
     }
     // First run: the flag usually lands after open() has already drawn the
@@ -991,10 +1047,14 @@ Item {
     root.aiProgress = ""
     root.aiResult = null
     root.aiQuery = ""
+    root.aiSeen = false
+    root.aiFinishedAt = 0
   }
 
   function notifyAiFinished(succeeded) {
-    if (root.opened && root.aiActive && !root.settingsActive && !root.tourActive) return
+    root.aiFinishedAt = Date.now()
+    root.aiSeen = root.opened && root.aiActive && !root.settingsActive && !root.tourActive
+    if (root.aiSeen) return
     Util.execArgv(["omarchy", "notification", "send", "--app-name", "Spotlight", "-g", "󰊠", "-u", "low",
       succeeded ? "Spotlight answer is ready" : "Spotlight AI could not finish",
       succeeded ? "Open Spotlight to read your answer." : "Open Spotlight to review the error.",
@@ -1421,7 +1481,8 @@ Item {
   // lib/Views.js builds and ranks the rows; this only fills in row defaults.
   function viewResultRows(name, q) {
     var specs = Views.rows(name, Query.viewDetails(name),
-      { state: root.viewState, entries: root.viewRows, partial: root.viewPartial }, q, Fuzzy.match)
+      { state: root.viewState, entries: root.viewRows, partial: root.viewPartial, note: root.viewNote },
+      q, Fuzzy.match)
     var out = []
     for (var i = 0; i < specs.length; i++) out.push(root.row(specs[i]))
     return out
@@ -1619,6 +1680,20 @@ Item {
     })
   }
 
+  function helpRows(q) {
+    var entries = Cheatsheet.entries(q)
+    var out = []
+    for (var i = 0; i < entries.length; i++) {
+      var e = entries[i]
+      out.push(root.row({ key: "help:" + e.example, kind: e.key ? "noop" : "view",
+        title: e.example, subtitle: e.what, section: e.section,
+        accessory: e.key ? "Key" : "Try", icon: e.icon, mono: !e.key,
+        primaryLabel: "Try it", textMatch: Fuzzy.MATCH_EXACT, tieRank: i,
+        resultType: "view", payload: { query: e.example } }))
+    }
+    return out
+  }
+
   function viewCompletionRows(q) {
     var views = Query.viewCompletions(q)
     var out = []
@@ -1694,6 +1769,8 @@ Item {
         subtitle: root.settings.aiEnabled ? parsed.text : "",
         accessory: "AI", icon: "󰚩", primaryLabel: root.settings.aiEnabled ? "Ask AI" : "Open settings"
       }))
+    } else if (parsed.filter === "help") {
+      push(root.helpRows(parsed.text))
     } else if (view) {
       push(root.viewResultRows(parsed.filter, parsed.text))
     } else if (parsed.filter === "window") {
@@ -1718,7 +1795,7 @@ Item {
         push(root.intentRows(parsed.text, parsed.filter))
       }
     } else if (!q) {
-      push(root.idleRows())
+      if (!root.settings.compactStart) push(root.idleRows())
     } else {
       push(root.viewCompletionRows(q))
       push(root.intentRows(q, ""))
@@ -1736,7 +1813,7 @@ Item {
     }
 
     // A view's rows arrive ranked and bounded by lib/Views.js.
-    if (!view) next = root.globallyRank(next, parsed.text)
+    if (!view && parsed.filter !== "help") next = root.globallyRank(next, parsed.text)
     root.rows = next
 
     displayModel.clear()
@@ -1940,6 +2017,8 @@ Item {
     }
     root.armedKey = ""
     if (!secondary) root.bumpUsage(r)
+    // used a result = done with this search, the ai row only sends the question
+    root.forgetOnClose = r.kind !== "ai"
 
     if (Query.isView(r.kind)) {
       root.runViewAction(Views.action(r.kind, r.payload, secondary))
@@ -1952,6 +2031,11 @@ Item {
       break
     case "view":
       root.completeView(r)
+      break
+
+    case "spotlight-help":
+      input.text = "help:"
+      input.cursorPosition = input.text.length
       break
 
     case "app":
@@ -2228,7 +2312,15 @@ Item {
     root.viewGeneration++
     root.viewRows = []
     root.viewPartial = false
+    root.viewNote = ""
     root.viewState = name ? "loading" : "idle"
+    var cached = name ? root.viewCache[name] : null
+    if (cached) {
+      root.viewRows = cached.rows
+      root.viewPartial = cached.partial
+      root.viewState = "ready"
+      root.viewNote = "updating…"
+    }
     if (!name || !root.opened) return
     proc = viewProcessComponent.createObject(root, {
       forView: name, forGeneration: root.viewGeneration,
@@ -2244,15 +2336,22 @@ Item {
 
   function finishView(raw, name, generation) {
     if (!root.opened || root.viewName !== name || root.viewGeneration !== generation) return
-    var field = Query.viewDetails(name).field
+    var details = Query.viewDetails(name)
     var reply = root.helperReply(raw)
-    if (!reply || !Array.isArray(reply[field])) {
-      root.viewRows = []
-      root.viewState = "error"
+    var cached = root.viewCache[name]
+    if (!reply || !Array.isArray(reply[details.field])) {
+      if (cached) {
+        root.viewNote = "could not refresh, list from " + Qt.formatTime(new Date(cached.at), "hh:mm")
+      } else {
+        root.viewRows = []
+        root.viewState = "error"
+      }
     } else {
-      root.viewRows = reply[field].slice(0, root.maxViewEntries)
+      root.viewRows = reply[details.field].slice(0, details.limit || root.maxViewEntries)
       root.viewState = "ready"
       root.viewPartial = reply.partial === true
+      root.viewNote = ""
+      if (details.cache) root.viewCache[name] = { rows: root.viewRows, partial: root.viewPartial, at: Date.now() }
     }
     root.rebuild()
   }
@@ -2396,6 +2495,7 @@ Item {
   onQueryChanged: {
     root.resetFolders()
     if (root.query !== root.aiQuery) root.aiActive = false
+    root.forgetOnClose = false
     root.armedKey = ""
     root.pendingCurrency = null
     // A new query invalidates a deliberate cursor: the row it named may not
@@ -2892,6 +2992,31 @@ Item {
     onTriggered: root.flushSettings()
   }
 
+  Timer {
+    id: blurSyncDebounce
+    interval: 400
+    onTriggered: {
+      if (blurSyncProc.running) { blurSyncDebounce.restart(); return }
+      blurSyncProc.command = root.helperArgv(["write-blur"].concat(root.settings.blur
+        ? ["on", String(root.settings.blurStrength)] : ["off"]))
+      blurSyncProc.running = true
+    }
+  }
+
+  Process {
+    id: blurSyncProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var reply = root.helperReply(text)
+        if (root.settings.blur && (!reply || reply.blur !== true))
+          Util.execArgv(["notify-send", "-u", "critical", "Spotlight blur not applied",
+            reply && reply.errors && reply.errors.length ? String(reply.errors[0])
+              : (root.helperError(text) || "Hyprland did not reload")])
+      }
+    }
+  }
+
   Process {
     id: settingsWriteProc
     // A helper that never started sends no reply, so nothing else settles it.
@@ -3056,12 +3181,17 @@ Item {
       readonly property int bodyHeight: root.aiActive
         ? Math.min(root.maxListHeight, availableBodyHeight)
         : listHeight
+      readonly property bool barOnly: root.settings.compactStart && !hasResults && !root.aiActive
+        && !root.settingsSaveFailed
+      // fades in as the growing card makes room, so it never sits on the search row
+      readonly property real footerReveal: Math.max(0, Math.min(1,
+        (height - root.searchHeight - root.footerHeight / 2) / (root.footerHeight / 2 + root.hairline)))
 
-      width: Math.min(root.previewShown ? Style.space(960) : Style.space(750),
+      width: Math.min(barOnly ? Style.space(560) : root.previewShown ? Style.space(960) : Style.space(750),
         panel.width - Style.space(48))
       height: root.searchHeight
         + (hasResults || root.aiActive ? root.hairline + root.listPadding * 2 + bodyHeight : 0)
-        + root.hairline + root.footerHeight
+        + (barOnly ? 0 : root.hairline + root.footerHeight)
       // Keep the search field fixed while results grow and shrink below it.
       x: Style.space(24) + Math.max(0, panel.width - width - Style.space(48))
         * root.settings.horizontalPosition / 100
@@ -3080,11 +3210,11 @@ Item {
 
       Behavior on height {
         enabled: !root.settings.reduceMotion
-        NumberAnimation { duration: 110; easing.type: Easing.OutCubic }
+        NumberAnimation { duration: root.motionMs; easing.type: root.motionEasing; easing.overshoot: 0.6 }
       }
       Behavior on width {
         enabled: !root.settings.reduceMotion
-        NumberAnimation { duration: 110; easing.type: Easing.OutCubic }
+        NumberAnimation { duration: root.motionMs; easing.type: root.motionEasing; easing.overshoot: 0.6 }
       }
 
       // Swallow clicks so they don't reach the dismiss MouseArea behind.
@@ -3134,10 +3264,16 @@ Item {
 
           onTextChanged: root.query = text
 
+          FontMetrics {
+            id: placeholderMetrics
+            font.family: input.font.family
+            font.pixelSize: input.font.pixelSize
+          }
+
           Text {
             anchors.fill: parent
             visible: input.text.length === 0
-            text: "Search for apps and commands…"
+            text: root.placeholder
             textFormat: Text.PlainText
             color: root.foreground
             opacity: 0.38
@@ -3161,6 +3297,10 @@ Item {
               }
               if (event.key === Qt.Key_Tab || event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
                 if (event.key === Qt.Key_Tab) aiPanel.focusFirst()
+                else if (!root.aiBusy) {
+                  root.forgetOnClose = true
+                  root.dismiss()
+                }
                 event.accepted = true
                 return
               }
@@ -3278,8 +3418,14 @@ Item {
         anchors.topMargin: root.listPadding
         anchors.bottomMargin: root.listPadding
         width: root.previewShown ? Math.round(card.width * 0.58) : card.width
-        height: card.listHeight
-        visible: card.hasResults
+        height: Math.min(card.listHeight, Math.max(0, footerDivider.y + root.hairline - root.listPadding - y))
+        clip: true
+        visible: opacity > 0
+        opacity: card.hasResults ? 1 : 0
+        Behavior on opacity {
+          enabled: !root.settings.reduceMotion
+          NumberAnimation { duration: Math.round(root.motionMs * 0.8); easing.type: Easing.OutCubic }
+        }
 
         ListView {
           id: resultList
@@ -3531,6 +3677,8 @@ Item {
         anchors.rightMargin: root.listPadding
         height: root.hairline
         color: root.dividerColor
+        opacity: card.footerReveal
+        visible: opacity > 0
       }
 
       Item {
@@ -3538,6 +3686,8 @@ Item {
         anchors { bottom: parent.bottom; left: parent.left; right: parent.right }
         anchors.bottomMargin: root.hairline
         height: root.footerHeight
+        opacity: card.footerReveal
+        visible: opacity > 0
 
         Text {
           text: root.settingsSaveFailed ? "Settings not saved" : "󰣇  Omarchy"

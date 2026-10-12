@@ -19,6 +19,8 @@ const root = {
 for (const name of ['resetFolders', 'leaveSettingsPanel', 'stopCurrencyProcess', 'stopPreviewProcess', 'resetView', 'updateCurrency', 'syncView', 'refreshPluginCommands',
     'rebuild', 'refreshSettings', 'refreshReminders', 'refreshToggleStates', 'resumeTour']) root[name] = noop;
 const context = vm.createContext({root, Query: require('../lib/Query.js'), Currency: require('../lib/Currency.js'),
+  Resume: require('../lib/Resume.js'), Placeholders: require('../lib/Placeholders.js'),
+  Style: {space: value => value}, panel: {width: 1920}, placeholderMetrics: {advanceWidth: text => text.length * 10},
   WeatherIntent: require('../lib/WeatherIntent.js'), Web: require('../lib/Web.js'),
   Qt: {callLater: fn => fn()}, Util: {execArgv: argv => notifications.push(Array.from(argv))},
   tour: {started: false}, pointerGate: {reset: noop}, resultList: {positionViewAtBeginning: noop},
@@ -39,7 +41,7 @@ for (const name of ['open', 'close', 'finishClose', 'stopQueryWork', 'stopAi', '
 }
 const queryChanged = source.match(/^  onQueryChanged: \{\n([\s\S]*?)^  \}/m);
 context.queryChanged = vm.runInContext('(function() {' + queryChanged[1] + '})', context);
-context.input = {forceActiveFocus: noop};
+context.input = {x: 60, forceActiveFocus: noop};
 Object.defineProperty(context.input, 'text', {
   get: () => root.query,
   set(value) { if (value !== root.query) { root.query = value; context.queryChanged(); } }

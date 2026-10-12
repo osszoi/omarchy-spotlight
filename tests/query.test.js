@@ -16,7 +16,8 @@ test("every colon alias selects exactly one provider", () => {
     calendar: "calendar", event: "calendar",
     man: "tldr", tldr: "tldr", ai: "ai",
     ports: "ports", ssh: "ssh", docker: "docker", services: "services", mounts: "mounts",
-    audio: "audio", wifi: "wifi", bluetooth: "bluetooth"
+    audio: "audio", wifi: "wifi", bluetooth: "bluetooth",
+    help: "help", cheatsheet: "help"
   }
 
   for (const [alias, provider] of Object.entries(aliases)) {
@@ -24,6 +25,14 @@ test("every colon alias selects exactly one provider", () => {
     assert.equal(parsed.filter, provider, alias)
     assert.equal(parsed.text, "needle", alias)
   }
+})
+
+test("? and help: open the cheatsheet", () => {
+  assert.deepEqual(Query.parse("?"), { raw: "?", text: "", filter: "help", empty: true })
+  assert.equal(Query.parse("? currency").text, "currency")
+  assert.equal(Query.parse("help: unit").filter, "help")
+  assert.deepEqual(Query.viewCompletions("hel"), ["help"])
+  assert.equal(Query.isView("help"), false)
 })
 
 test("empty filters are hints, not unscoped searches", () => {

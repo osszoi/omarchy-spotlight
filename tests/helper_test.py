@@ -293,6 +293,49 @@ class HelperTests(unittest.TestCase):
             with self.assertRaises(HELPER.Denied):
                 HELPER.cmd_docker()
 
+    def test_gh_repos_checks_names_and_builds_urls(self):
+        lines = [
+            {"name": "osszoi/old", "description": "a\nb", "private": False, "archived": True,
+             "pushed": "2020-01-01T00:00:00Z"},
+            {"name": "Dawere/backend-api", "description": None, "private": True, "archived": False,
+             "pushed": "2026-10-12T18:00:00Z"},
+            {"name": "-evil/../repo", "private": True},
+        ]
+        raw = "".join(json.dumps(line) + "\n" for line in lines).encode()
+        with mock.patch.object(HELPER, "run_bounded", return_value=(raw, False, 0)) as run_gh:
+            reply = run(HELPER.cmd_gh_repos)
+        run_gh.assert_called_once_with(HELPER.GH_REPOS_ARGV, HELPER.GH_BYTES, HELPER.GH_DEADLINE,
+                                       want_status=True)
+        self.assertEqual([r["name"] for r in reply["repos"]], ["Dawere/backend-api", "osszoi/old"])
+        self.assertEqual(reply["repos"][0]["url"], "https://github.com/Dawere/backend-api")
+        self.assertEqual(reply["repos"][1]["description"], "a b")
+        self.assertFalse(reply["partial"])
+        with mock.patch.object(HELPER, "run_bounded", return_value=(b"", False, 4)):
+            with self.assertRaises(HELPER.Denied):
+                HELPER.cmd_gh_repos()
+
+    def test_gh_prs_searches_the_user_and_their_orgs(self):
+        prs = [
+            {"number": 2, "title": "old", "repository": {"nameWithOwner": "osszoi/cli"},
+             "author": {"login": "dependabot[bot]"}, "updatedAt": "2021-05-07T01:52:09Z", "isDraft": False},
+            {"number": 1402, "title": "feat", "repository": {"nameWithOwner": "Dawere/backend-api"},
+             "author": {"login": "pedro"}, "updatedAt": "2026-10-12T18:31:11Z", "isDraft": True},
+            {"number": "3", "title": "bad number", "repository": {"nameWithOwner": "Dawere/x"}},
+        ]
+        replies = [(b"osszoi\nDawere\n-flag\n", False, 0), (json.dumps(prs).encode(), False, 0)]
+        with mock.patch.object(HELPER, "run_bounded", side_effect=replies) as run_gh:
+            reply = run(HELPER.cmd_gh_prs)
+        search = run_gh.call_args_list[1].args[0]
+        self.assertEqual(search[:3], ["gh", "search", "prs"])
+        self.assertEqual(search[-2:], ["--owner=osszoi", "--owner=Dawere"])
+        self.assertEqual([(p["repo"], p["number"]) for p in reply["prs"]],
+                         [("Dawere/backend-api", 1402), ("osszoi/cli", 2)])
+        self.assertEqual(reply["prs"][0]["url"], "https://github.com/Dawere/backend-api/pull/1402")
+        self.assertIs(reply["prs"][0]["draft"], True)
+        with mock.patch.object(HELPER, "run_bounded", return_value=(b"", False, 0)):
+            with self.assertRaises(HELPER.Denied):
+                HELPER.cmd_gh_prs()
+
     def test_docker_keeps_complete_rows_at_byte_cap_and_reads_podman_fields(self):
         podman = {"Id": "c" * 64, "Names": ["worker"], "Image": "busybox",
                   "State": "running", "Status": "Up", "Ports": []}
@@ -1174,6 +1217,40 @@ EXPECTED_AFTER_WRITE = LUA_FIXTURE.replace(
     'o.bind("CTRL + SPACE"', HELPER.DISABLED_PREFIX + 'o.bind("CTRL + SPACE"') + "\n" + MANAGED
 
 
+class BlurWriteTests(unittest.TestCase):
+    TOGGLE = Path(".local", "state", "omarchy", "toggles", "hypr", "spotlight-blur.lua")
+
+    def test_bad_arguments_are_refused(self):
+        for argv in ([], ["on"], ["on", "x"], ["on", "-1"], ["maybe"], ["off", "3"]):
+            with self.subTest(argv=argv):
+                with self.assertRaises(HELPER.Denied):
+                    HELPER.cmd_write_blur(argv)
+
+    def test_on_writes_the_toggle_and_off_removes_it(self):
+        replies = {b"reload": b"ok", b"j/configerrors": b'[""]'}
+        with fake_home() as home, mock.patch.object(HELPER, "_hypr_request", side_effect=replies.get):
+            reply = run(HELPER.cmd_write_blur, ["on", "6"])
+            self.assertTrue(reply["blur"])
+            text = (home / self.TOGGLE).read_text()
+            self.assertIn("size = 12, passes = 2", text)
+            self.assertIn('namespace = "omarchy-spotlight"', text)
+            reply = run(HELPER.cmd_write_blur, ["off"])
+            self.assertFalse(reply["blur"])
+            self.assertFalse((home / self.TOGGLE).exists())
+
+    def test_new_config_errors_roll_the_toggle_back(self):
+        errors = iter([b'["old error"]', b'["old error", "spotlight-blur.lua:2: boom"]'])
+
+        def request(payload):
+            return b"ok" if payload == b"reload" else next(errors, b'["old error"]')
+
+        with fake_home() as home, mock.patch.object(HELPER, "_hypr_request", side_effect=request):
+            reply = run(HELPER.cmd_write_blur, ["on", "4"])
+            self.assertFalse(reply["blur"])
+            self.assertEqual(reply["errors"], ["spotlight-blur.lua:2: boom"])
+            self.assertFalse((home / self.TOGGLE).exists())
+
+
 class SettingsWriteTests(unittest.TestCase):
     def test_positions_default_clamp_and_reject_invalid_types(self):
         for key in ("verticalPosition", "horizontalPosition"):
@@ -1184,6 +1261,42 @@ class SettingsWriteTests(unittest.TestCase):
             for value in (None, True, False, "25", 25.5, [], {}, float("inf"), float("nan")):
                 with self.subTest(key=key, value=value):
                     self.assertEqual(HELPER.normalize_settings({key: value})[key], 50)
+
+    def test_appearance_numbers_default_clamp_and_reject_invalid_types(self):
+        for key, default, low, high in (("cardOpacity", 92, 40, 100), ("blurStrength", 4, 1, 10)):
+            self.assertEqual(HELPER.normalize_settings({})[key], default)
+            for value, expected in ((low - 5, low), (low, low), (high, high), (high + 5, high)):
+                with self.subTest(key=key, value=value):
+                    self.assertEqual(HELPER.normalize_settings({key: value})[key], expected)
+            for value in (None, True, "50", 5.5, []):
+                with self.subTest(key=key, value=value):
+                    self.assertEqual(HELPER.normalize_settings({key: value})[key], default)
+        self.assertIs(HELPER.normalize_settings({})["blur"], False)
+        self.assertIs(HELPER.normalize_settings({"blur": True})["blur"], True)
+        self.assertIs(HELPER.normalize_settings({"blur": "yes"})["blur"], False)
+
+    def test_keep_last_search_defaults_and_clamps(self):
+        self.assertEqual(HELPER.normalize_settings({})["keepQuerySeconds"], 5)
+        for value, expected in ((-1, 0), (0, 0), (300, 300), (999, 300), (True, 5), ("10", 5), (2.5, 5)):
+            with self.subTest(value=value):
+                self.assertEqual(HELPER.normalize_settings({"keepQuerySeconds": value})["keepQuerySeconds"], expected)
+        self.assertIs(HELPER.normalize_settings({})["keepQueryForever"], False)
+        self.assertIs(HELPER.normalize_settings({"keepQueryForever": True})["keepQueryForever"], True)
+        self.assertIs(HELPER.normalize_settings({"keepQueryForever": 1})["keepQueryForever"], False)
+
+    def test_compact_start_and_motion_settings(self):
+        defaults = HELPER.normalize_settings({})
+        self.assertIs(defaults["compactStart"], True)
+        self.assertEqual((defaults["motionStyle"], defaults["motionDuration"]), ("soft", 320))
+        self.assertIs(HELPER.normalize_settings({"compactStart": False})["compactStart"], False)
+        self.assertIs(HELPER.normalize_settings({"compactStart": 0})["compactStart"], True)
+        for style in ("soft", "spring", "gentle", "snappy"):
+            self.assertEqual(HELPER.normalize_settings({"motionStyle": style})["motionStyle"], style)
+        for style in ("bouncy", "", None, 1):
+            self.assertEqual(HELPER.normalize_settings({"motionStyle": style})["motionStyle"], "soft")
+        for value, expected in ((10, 60), (110, 110), (5000, 1000), (True, 320), ("200", 320)):
+            with self.subTest(value=value):
+                self.assertEqual(HELPER.normalize_settings({"motionDuration": value})["motionDuration"], expected)
 
     def test_positions_persist_and_survive_unrelated_updates(self):
         with fake_home() as home:

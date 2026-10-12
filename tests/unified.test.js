@@ -17,9 +17,9 @@ test("the displayed model is one globally ranked, capped list with provider sect
     assert.ok(qml.includes(`return "${label}"`))
 })
 
-test("empty input is a per-section digest and empty filters show only a hint", () => {
+test("empty input is a per-section digest (off with compact start) and empty filters show only a hint", () => {
   assert.match(qml, /if \(parsed\.empty\) \{\s*next\.push\(root\.filterHintRow\(parsed\)\)/)
-  assert.match(qml, /else if \(!q\) \{\s*push\(root\.idleRows\(\)\)/)
+  assert.match(qml, /else if \(!q\) \{\s*if \(!root\.settings\.compactStart\) push\(root\.idleRows\(\)\)/)
   assert.match(qml, /var fallback = root\.appRows\("", false\)/)
   // Each source is ranked and capped on its own, so the longest one cannot
   // crowd the others out of the digest the way an uncapped app list did.

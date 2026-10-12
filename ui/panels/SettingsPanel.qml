@@ -315,6 +315,52 @@ FocusScope {
         SettingRow {
           visible: panel.activeTab === "appearance"
           chrome: panel.chrome
+          glyph: "󰗌"
+          switchable: false
+          title: "Background opacity"
+          description: "How solid the Spotlight card is. Lower values let the screen behind show through; pair them with Blur to keep text readable."
+
+          trailing: Stepper {
+            chrome: panel.chrome
+            value: panel.draft.cardOpacity
+            from: 40
+            to: 100
+            step: 1
+            onChanged: function(v) { panel.set("cardOpacity", v) }
+          }
+        }
+
+        SettingRow {
+          visible: panel.activeTab === "appearance"
+          chrome: panel.chrome
+          glyph: "󰂵"
+          title: "Blur"
+          description: "Frost what is behind the card. Turns on Hyprland blur for Spotlight only (windows stay unblurred) and reloads Hyprland."
+          checked: panel.draft.blur === true
+          onToggled: panel.toggle("blur")
+        }
+
+        SettingRow {
+          visible: panel.activeTab === "appearance" && panel.draft.blur === true
+          chrome: panel.chrome
+          glyph: "󰂵"
+          switchable: false
+          title: "Blur strength"
+          description: "1 is a light frost, 10 is heavy. Each change reloads Hyprland."
+
+          trailing: Stepper {
+            chrome: panel.chrome
+            value: panel.draft.blurStrength
+            from: 1
+            to: 10
+            step: 1
+            onChanged: function(v) { panel.set("blurStrength", v) }
+          }
+        }
+
+        SettingRow {
+          visible: panel.activeTab === "appearance"
+          chrome: panel.chrome
           glyph: "󰕮"
           title: "Preview pane"
           description: "Show details for the selected result beside the list: conversions, file contents, clipboard entries and more."
@@ -330,6 +376,56 @@ FocusScope {
           description: "Skip Spotlight's opening, closing and resizing animations."
           checked: panel.draft.reduceMotion === true
           onToggled: panel.toggle("reduceMotion")
+        }
+
+        SettingRow {
+          visible: panel.activeTab === "appearance"
+          chrome: panel.chrome
+          glyph: "󰡌"
+          title: "Compact start"
+          description: "Open as just a narrow search bar that widens as results arrive. Off opens the full card with recent apps, files and windows."
+          checked: panel.draft.compactStart === true
+          onToggled: panel.toggle("compactStart")
+        }
+
+        SettingRow {
+          visible: panel.activeTab === "appearance" && panel.draft.reduceMotion !== true
+          chrome: panel.chrome
+          glyph: "󰗘"
+          switchable: false
+          title: "Motion style"
+          description: "How the card grows and shrinks. Soft settles calmly, Spring overshoots a touch, Gentle eases in and out, Snappy is the original curve."
+
+          trailing: ChoiceMenu {
+            chrome: panel.chrome
+            bounds: panel
+            value: panel.draft.motionStyle
+            options: [
+              { value: "soft", label: "Soft" },
+              { value: "spring", label: "Spring" },
+              { value: "gentle", label: "Gentle" },
+              { value: "snappy", label: "Snappy" }
+            ]
+            onChanged: function(v) { panel.set("motionStyle", v) }
+          }
+        }
+
+        SettingRow {
+          visible: panel.activeTab === "appearance" && panel.draft.reduceMotion !== true
+          chrome: panel.chrome
+          glyph: "󰔛"
+          switchable: false
+          title: "Animation time (ms)"
+          description: "How long each resize takes. Snappy at 110 ms is how Spotlight used to feel."
+
+          trailing: Stepper {
+            chrome: panel.chrome
+            value: panel.draft.motionDuration
+            from: 60
+            to: 1000
+            step: 10
+            onChanged: function(v) { panel.set("motionDuration", v) }
+          }
         }
 
         GroupLabel { text: "SOURCES"; visible: panel.activeTab === "search" }
@@ -547,6 +643,36 @@ FocusScope {
               text: "Change"
               onClicked: panel.action("shortcut")
             }
+          }
+        }
+
+        GroupLabel { text: "LAST SEARCH"; visible: panel.activeTab === "general" }
+
+        SettingRow {
+          visible: panel.activeTab === "general"
+          chrome: panel.chrome
+          glyph: "󰛤"
+          title: "Keep it forever"
+          description: "Reopening Spotlight always brings back what was in the box, AI answers included."
+          checked: panel.draft.keepQueryForever === true
+          onToggled: panel.toggle("keepQueryForever")
+        }
+
+        SettingRow {
+          visible: panel.activeTab === "general" && panel.draft.keepQueryForever !== true
+          chrome: panel.chrome
+          glyph: "󰋚"
+          switchable: false
+          title: "Keep it for (seconds)"
+          description: "Reopen within this many seconds and your last search comes back, 0 always opens empty. Enter on a result or an AI answer forgets it right away. An AI answer you haven't seen yet waits 10 minutes."
+
+          trailing: Stepper {
+            chrome: panel.chrome
+            value: panel.draft.keepQuerySeconds
+            from: 0
+            to: 300
+            step: 1
+            onChanged: function(v) { panel.set("keepQuerySeconds", v) }
           }
         }
 

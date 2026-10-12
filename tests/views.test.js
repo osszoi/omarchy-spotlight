@@ -144,3 +144,55 @@ test("repeated keys are dropped and at most one extra row is added", () => {
   assert.equal(rows("bluetooth", ready(devices)).length, 201)
   assert.equal(Views.action("unknown", {}, false), null)
 })
+
+const repos = [
+  { name: "Dawere/backend-api", description: "Dawere's BackEnd", private: true, archived: false,
+    url: "https://github.com/Dawere/backend-api", pushed: "2026-10-12T18:00:00Z" },
+  { name: "osszoi/omarchy-spotlight", description: "", private: false, archived: false,
+    url: "https://github.com/osszoi/omarchy-spotlight", pushed: "2026-10-11T18:00:00Z" },
+  { name: "osszoi/old-pipeline", description: "", private: false, archived: true,
+    url: "https://github.com/osszoi/old-pipeline", pushed: "2020-01-01T00:00:00Z" }
+]
+const prs = [
+  { repo: "Dawere/backend-api", number: 1402, title: "feat: enrolment events", author: "pedro",
+    url: "https://github.com/Dawere/backend-api/pull/1402", updated: "2026-10-12T18:31:11Z", draft: false },
+  { repo: "Dawere/e2e", number: 1, title: "Bump brace-expansion", author: "dependabot[bot]",
+    url: "https://github.com/Dawere/e2e/pull/1", updated: "2026-10-12T17:00:00Z", draft: true }
+]
+
+test("gh: keeps only repos whose name contains the text, no fuzzy matches", () => {
+  assert.deepEqual(rows("gh", ready(repos), "api").map(r => r.title), ["Dawere/backend-api"])
+  assert.deepEqual(rows("gh", ready(repos), "OSSZOI/").map(r => r.title),
+    ["osszoi/omarchy-spotlight", "osszoi/old-pipeline"])
+  assert.equal(rows("gh", ready(repos), "zzz")[0].title, "No matching repositories")
+  const archived = rows("gh", ready(repos)).find(r => r.title === "osszoi/old-pipeline")
+  assert.equal(archived.accessory, "Archived")
+  assert.deepEqual(Views.action("gh", archived.payload, false), { url: "https://github.com/osszoi/old-pipeline" })
+  assert.deepEqual(Views.action("gh", archived.payload, true), { copy: "https://github.com/osszoi/old-pipeline" })
+})
+
+test("pr: filters by title, repo, author or number and opens the PR", () => {
+  assert.deepEqual(rows("pr", ready(prs), "dependabot").map(r => r.title), ["Bump brace-expansion"])
+  assert.deepEqual(rows("pr", ready(prs), "#1402").map(r => r.title), ["feat: enrolment events"])
+  assert.deepEqual(rows("pr", ready(prs), "e2e").map(r => r.accessory), ["Draft"])
+  const first = rows("pr", ready(prs))[0]
+  assert.match(first.subtitle, /^Dawere\/backend-api #1402 · pedro · /)
+  assert.deepEqual(Views.action("pr", first.payload, false), { url: "https://github.com/Dawere/backend-api/pull/1402" })
+  assert.equal(rows("pr", { state: "error" })[0].title, "GitHub CLI unavailable · check gh auth status")
+})
+
+test("a cached list says it is refreshing", () => {
+  const view = { state: "ready", entries: prs, partial: false, note: "updating…" }
+  assert.equal(rows("pr", view)[0].section, "Open pull requests · updating…")
+})
+
+test("ago reads like a person would say it", () => {
+  const now = Date.parse("2026-10-12T12:00:00Z")
+  assert.equal(Views.ago("2026-10-12T11:59:40Z", now), "just now")
+  assert.equal(Views.ago("2026-10-12T11:15:00Z", now), "45m ago")
+  assert.equal(Views.ago("2026-10-12T07:00:00Z", now), "5h ago")
+  assert.equal(Views.ago("2026-10-09T12:00:00Z", now), "3d ago")
+  assert.equal(Views.ago("2026-06-12T12:00:00Z", now), "4mo ago")
+  assert.equal(Views.ago("2021-05-07T01:52:09Z", now), "5y ago")
+  assert.equal(Views.ago("", now), "")
+})

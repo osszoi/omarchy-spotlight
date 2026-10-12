@@ -3,9 +3,22 @@
 **A fast, local-first command palette for Omarchy.**
 
 Fork of [maajix/omarchy-spotlight](https://github.com/maajix/omarchy-spotlight) (MIT), renamed to
-`eduardo.spotlight`. The only other difference is that the preview pane also keeps the contents of
-`~/.kube`, `~/.docker`, `~/.aws`, `~/.codex`, `~/.config/gh`, `~/.config/gcloud`, `*.cnf` and
-`auth.json` off screen. The website and documentation below are upstream's.
+`eduardo.spotlight`. Differences from upstream:
+
+- the preview pane also keeps the contents of `~/.kube`, `~/.docker`, `~/.aws`, `~/.codex`,
+  `~/.config/gh`, `~/.config/gcloud`, `*.cnf` and `auth.json` off screen
+- **Settings > Appearance** has Background opacity and Blur (card only) with a strength
+- `help:` (or `?`) lists everything Spotlight can do, with examples
+- **Settings > General > Last search**: reopening brings back your last search only within N seconds
+  (default 5, or forever). Enter on a result or an AI answer forgets it right away, and an AI answer
+  you haven't seen yet waits 10 minutes
+- **Settings > Appearance > Compact start** opens a narrow bar that widens as results arrive, with a
+  selectable motion style and animation time, and the empty box shows a random placeholder
+- `gh:` lists your and your orgs' GitHub repos (`gh: api` keeps names containing "api") and `pr:`
+  lists their open pull requests; both use the GitHub CLI you're already signed in to and show the
+  last list instantly while refreshing
+
+The website and documentation below are upstream's.
 
 Launch apps, switch windows, find files, search your clipboard and control your desktop from one input. Calculate, convert currencies, create reminders, search the web or ask AI without leaving Spotlight.
 
@@ -54,7 +67,7 @@ After moving to a folder result with **↑ / ↓**, press **→** to move the se
 
 ## Ask AI
 
-Enable **Ask AI** in Spotlight Settings and choose an installed, signed-in **Claude or Codex CLI**. Submit questions with `ai:` and Enter. Answers can include copyable code and commands, maps, weather, charts, palettes, timelines and other visual cards. Requests stay available when you close and reopen Spotlight.
+Enable **Ask AI** in Spotlight Settings and choose an installed, signed-in **Claude or Codex CLI**. Submit questions with `ai:` and Enter. Answers can include copyable code and commands, maps, weather, charts, palettes, timelines and other visual cards. A running request keeps going when you close Spotlight; its answer comes back on reopen as described under Last search above.
 
 AI and AI web search are opt-in. Generated commands are shown for you to review and copy. [AI setup and usage](https://maajix.github.io/omarchy-spotlight/docs/?p=ask-ai) · [All twelve artifact types](https://maajix.github.io/omarchy-spotlight/docs/?p=ai-artifacts)
 
