@@ -27,9 +27,11 @@ files owned by us, which is what keeps a planted symlink, FIFO or device out.
 from contextlib import nullcontext
 import errno
 import fcntl
+import base64
 import fnmatch
 import glob
 import hashlib
+import hmac
 import ipaddress
 import json
 import math
@@ -43,6 +45,7 @@ import shutil
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -148,6 +151,82 @@ GH_REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}$"
 GH_REPOS_ARGV = ["gh", "api", "--paginate",
                  "/user/repos?per_page=100&affiliation=owner,organization_member&sort=pushed",
                  "--jq", ".[] | {name: .full_name, description, private, archived, pushed: .pushed_at}"]
+REPO_ROOTS = ("Work", "Projects", "projects", "src", "code", "dev", "repos", "git")
+REPO_DEPTH = 4
+REPO_COUNT = 1000
+REPO_SKIP = frozenset({"node_modules", "target", "build", "dist", "vendor", "venv", "__pycache__"})
+
+PROC_COUNT = 300
+PROC_SAMPLE = 0.3
+# killing any of these takes the session down with it, kill: never lists them
+PROC_PROTECTED = frozenset({
+    "Hyprland", "hyprland", "start-hyprland", "quickshell", ".quickshell-wra", "qs", "uwsm",
+    "systemd", "(sd-pam)", "dbus-daemon", "dbus-broker", "dbus-broker-lau", "pipewire",
+    "pipewire-pulse", "wireplumber", "sddm", "Xwayland", "gnome-keyring-d", "ssh-agent",
+    "gpg-agent", "at-spi-bus-laun", "at-spi2-registr", "hypridle", "systemd-inhibit",
+})
+# omarchy's own watchers (lock before suspend, shell supervisor) and the portals
+PROC_PROTECTED_PREFIXES = ("omarchy-", "xdg-")
+SYS_SKIP_LINKS = ("lo", "docker", "br-", "veth", "virbr", "vnet")
+
+OTP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+OTP_HASHES = {"SHA1": hashlib.sha1, "SHA256": hashlib.sha256, "SHA512": hashlib.sha512}
+
+K8S_BYTES = 8 * 1024 * 1024
+K8S_DEADLINE = 15.0
+K8S_COUNT = 1000
+K8S_CONTEXTS = 6
+K8S_CONTEXT_RE = re.compile(r"^[A-Za-z0-9_.:@/][A-Za-z0-9_.:@/-]{0,199}$")
+K8S_NAME_RE = re.compile(r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$")
+K8S_COLUMNS = ("custom-columns=NS:.metadata.namespace,NAME:.metadata.name,PHASE:.status.phase,"
+               "WAITING:.status.containerStatuses[*].state.waiting.reason,"
+               "READY:.status.containerStatuses[*].ready,"
+               "RESTARTS:.status.containerStatuses[*].restartCount,"
+               "START:.metadata.creationTimestamp,DELETING:.metadata.deletionTimestamp")
+
+JIRA_BYTES = 16 * 1024 * 1024
+JIRA_DEADLINE = 20.0
+JIRA_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]{1,9}-[0-9]{1,7}$")
+JIRA_SERVER_RE = re.compile(r"""^server:\s*['"]?(https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?(?:/[A-Za-z0-9._~-]+)*)/?['"]?\s*$""")
+JIRA_JQL = "assignee = currentUser() AND statusCategory != Done"
+# only a plain literal, anything with $ or backticks would need bash to evaluate it
+JIRA_TOKEN_RE = re.compile(r"""^\s*(?:export\s+)?JIRA_API_TOKEN=(?:"([^"$`\\]*)"|'([^']*)'|([^\s"'$`\\;]+))\s*(?:#.*)?$""")
+
+TZ_QUERY_CHARS = 120
+# what people type that the tz database doesn't name, abbreviations mean the local clock there
+TZ_ALIASES = {
+    "est": "America/New_York", "edt": "America/New_York", "et": "America/New_York",
+    "cst": "America/Chicago", "cdt": "America/Chicago", "ct": "America/Chicago",
+    "mst": "America/Denver", "mdt": "America/Denver", "mt": "America/Denver",
+    "pst": "America/Los_Angeles", "pdt": "America/Los_Angeles", "pt": "America/Los_Angeles",
+    "akst": "America/Anchorage", "hst": "Pacific/Honolulu", "utc": "UTC", "gmt": "UTC", "z": "UTC",
+    "bst": "Europe/London", "cet": "Europe/Paris", "cest": "Europe/Paris", "eet": "Europe/Athens",
+    "eest": "Europe/Athens", "wet": "Europe/Lisbon", "ist": "Asia/Kolkata", "jst": "Asia/Tokyo",
+    "kst": "Asia/Seoul", "sgt": "Asia/Singapore", "hkt": "Asia/Hong_Kong", "aest": "Australia/Sydney",
+    "aedt": "Australia/Sydney", "nzst": "Pacific/Auckland", "nzdt": "Pacific/Auckland",
+    "vet": "America/Caracas", "art": "America/Argentina/Buenos_Aires", "brt": "America/Sao_Paulo",
+    "clt": "America/Santiago", "cot": "America/Bogota", "pet": "America/Lima",
+    "nyc": "America/New_York", "new york city": "America/New_York", "miami": "America/New_York",
+    "boston": "America/New_York", "atlanta": "America/New_York", "washington": "America/New_York",
+    "dc": "America/New_York", "philadelphia": "America/New_York", "orlando": "America/New_York",
+    "dallas": "America/Chicago", "houston": "America/Chicago", "austin": "America/Chicago",
+    "sf": "America/Los_Angeles", "san francisco": "America/Los_Angeles", "la": "America/Los_Angeles",
+    "seattle": "America/Los_Angeles", "san diego": "America/Los_Angeles",
+    "las vegas": "America/Los_Angeles", "portland": "America/Los_Angeles",
+    "beijing": "Asia/Shanghai", "delhi": "Asia/Kolkata", "new delhi": "Asia/Kolkata",
+    "mumbai": "Asia/Kolkata", "bangalore": "Asia/Kolkata", "barcelona": "Europe/Madrid",
+    "munich": "Europe/Berlin", "frankfurt": "Europe/Berlin", "milan": "Europe/Rome",
+    "venezuela": "America/Caracas", "colombia": "America/Bogota", "peru": "America/Lima",
+    "chile": "America/Santiago", "argentina": "America/Argentina/Buenos_Aires",
+    "brazil": "America/Sao_Paulo", "mexico": "America/Mexico_City", "spain": "Europe/Madrid",
+    "uk": "Europe/London", "england": "Europe/London", "france": "Europe/Paris",
+    "germany": "Europe/Berlin", "italy": "Europe/Rome", "portugal": "Europe/Lisbon",
+    "japan": "Asia/Tokyo", "china": "Asia/Shanghai", "india": "Asia/Kolkata", "korea": "Asia/Seoul",
+    "australia": "Australia/Sydney", "panama": "America/Panama", "dominican republic": "America/Santo_Domingo",
+    "puerto rico": "America/Puerto_Rico", "ecuador": "America/Guayaquil",
+}
+TZ_CLOCK = r"(noon|midnight|\d{1,2}(?::\d{2})?\s*(?:am|pm)?)"
+
 GH_OWNERS_ARGV = ["gh", "api", "graphql", "-f", "query={viewer{login organizations(first:100){nodes{login}}}}",
                   "--jq", "[.data.viewer.login] + [.data.viewer.organizations.nodes[].login] | .[]"]
 
@@ -622,7 +701,7 @@ def write_new(dirfd, name, payload):
 
 # ------------------------------------------------------------ subprocesses
 def run_bounded(argv, cap, deadline, stdin_bytes=None, want_status=False, on_line=None,
-                merge_stderr=False):
+                merge_stderr=False, env=None):
     """Run `argv`, returning at most `cap` bytes of stdout within `deadline`.
 
     The child gets its own session, so the deadline tears down the whole
@@ -650,6 +729,7 @@ def run_bounded(argv, cap, deadline, stdin_bytes=None, want_status=False, on_lin
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT if merge_stderr else subprocess.DEVNULL,
             start_new_session=True,
+            env=env,
         )
         ACTIVE_PROC = proc
     except OSError as exc:
@@ -2593,8 +2673,9 @@ def cmd_preview_view(argv):
     emit(handler(*argv[1:]))
 
 
-def view_output(argv, cap, deadline, message, allow_partial=False):
-    raw, truncated, status = run_bounded(argv, cap, deadline, want_status=True)
+def view_output(argv, cap, deadline, message, allow_partial=False, env=None):
+    raw, truncated, status = run_bounded(argv, cap, deadline, want_status=True,
+                                         **({"env": env} if env is not None else {}))
     if (status != 0 and (not allow_partial or not truncated)) \
             or (truncated and (not allow_partial or not raw)):
         raise Denied(message)
@@ -2753,6 +2834,563 @@ def cmd_gh_prs():
         })
     rows.sort(key=lambda row: row["updated"], reverse=True)
     emit({"prs": rows[:GH_PR_COUNT], "partial": len(rows) > GH_PR_COUNT})
+
+
+def notify(headline, description=""):
+    try:
+        subprocess.Popen(["omarchy-notification-send", "--app-name", "Spotlight", "-u", "low", headline]
+                         + ([description] if description else []),
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass
+
+
+def _feed(argv, text):
+    """Hand `text` to a program on stdin, so it never shows up in a process list."""
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True)
+    proc.communicate(text.encode("utf-8"), timeout=5)
+    if proc.returncode != 0:
+        raise Denied("%s failed" % argv[0])
+
+
+def copy_text(text):
+    _feed(["wl-copy"], text)
+
+
+def type_text(text):
+    _feed(["wtype", "-"], text)
+
+
+# ------------------------------------------------------------------ repo:
+def _repo_info(path, dotgit):
+    gitdir = dotgit
+    if os.path.isfile(dotgit) and not os.path.islink(dotgit):
+        try:
+            with open(dotgit, "rb") as f:
+                line = f.read(4096).decode("utf-8", "replace").strip()
+        except OSError:
+            line = ""
+        if line.startswith("gitdir:"):
+            gitdir = os.path.join(path, line[7:].strip())
+    active = 0.0
+    for name in ("HEAD", "index", "FETCH_HEAD", "ORIG_HEAD"):
+        try:
+            active = max(active, os.stat(os.path.join(gitdir, name)).st_mtime)
+        except OSError:
+            pass
+    try:
+        with open(os.path.join(gitdir, "HEAD"), "rb") as f:
+            head = f.read(256).decode("utf-8", "replace").strip()
+    except OSError:
+        head = ""
+    branch = head[16:] if head.startswith("ref: refs/heads/") else (
+        head[:7] if re.fullmatch(r"[0-9a-f]{40,64}", head) else "")
+    return clamp_text(branch, 100), int(active)
+
+
+def cmd_local_repos():
+    home = os.environ.get("HOME", "")
+    if not home.startswith("/"):
+        raise Denied("HOME is not an absolute path")
+    rows = []
+    for root_name in REPO_ROOTS:
+        top = os.path.join(home, root_name)
+        if os.path.islink(top) or not os.path.isdir(top):
+            continue
+        stack = [(top, 0)]
+        while stack and len(rows) <= REPO_COUNT:
+            path, depth = stack.pop()
+            try:
+                entries = list(os.scandir(path))
+            except OSError:
+                continue
+            dotgit = next((e for e in entries if e.name == ".git"), None)
+            if dotgit is not None:
+                branch, active = _repo_info(path, dotgit.path)
+                rows.append({"name": clamp_text(os.path.basename(path), 200),
+                             "path": path, "where": os.path.relpath(os.path.dirname(path), home),
+                             "branch": branch, "active": active})
+                continue
+            if depth >= REPO_DEPTH:
+                continue
+            for entry in entries:
+                if (not entry.name.startswith(".") and entry.name not in REPO_SKIP
+                        and entry.is_dir(follow_symlinks=False)):
+                    stack.append((entry.path, depth + 1))
+    rows.sort(key=lambda row: row["active"], reverse=True)
+    emit({"repos": rows[:REPO_COUNT], "partial": len(rows) > REPO_COUNT})
+
+
+# ------------------------------------------------------------------ kill:
+def _proc_stat(pid):
+    with open("/proc/%d/stat" % pid, "rb") as f:
+        raw = f.read(4096).decode("utf-8", "replace")
+    close = raw.rfind(")")
+    fields = raw[close + 2:].split()
+    # fields[n - 3] is stat field n: utime 14, stime 15, starttime 22, rss 24
+    return raw[raw.find("(") + 1:close], int(fields[11]) + int(fields[12]), int(fields[19]), int(fields[21])
+
+
+def _protected(comm):
+    return comm in PROC_PROTECTED or comm.startswith(PROC_PROTECTED_PREFIXES)
+
+
+def _own_pids():
+    pids = []
+    for name in os.listdir("/proc"):
+        if name.isdigit():
+            try:
+                if os.stat("/proc/" + name).st_uid == EUID:
+                    pids.append(int(name))
+            except OSError:
+                pass
+    return pids
+
+
+def cmd_procs():
+    tick = os.sysconf("SC_CLK_TCK")
+    page = os.sysconf("SC_PAGE_SIZE")
+    skip = {os.getpid(), os.getppid()}
+    first = {}
+    for pid in _own_pids():
+        try:
+            first[pid] = _proc_stat(pid)
+        except (OSError, ValueError, IndexError):
+            pass
+    time.sleep(PROC_SAMPLE)
+    rows = []
+    for pid, (comm, cpu, start, _rss) in first.items():
+        if pid in skip or _protected(comm):
+            continue
+        try:
+            _comm, cpu_now, start_now, rss = _proc_stat(pid)
+            with open("/proc/%d/cmdline" % pid, "rb") as f:
+                cmdline = f.read(2048)
+        except (OSError, ValueError, IndexError):
+            continue
+        if start_now != start or not cmdline:
+            continue
+        args = " ".join(part.decode("utf-8", "replace") for part in cmdline.split(b"\0") if part)
+        rows.append({"pid": pid, "start": start, "name": clamp_text(comm, 64),
+                     "cpu": round(max(0, cpu_now - cpu) * 100.0 / tick / PROC_SAMPLE, 1),
+                     "rss": rss * page, "args": one_line(args, 300)})
+    rows.sort(key=lambda row: (-row["cpu"], -row["rss"]))
+    emit({"processes": rows[:PROC_COUNT], "partial": len(rows) > PROC_COUNT})
+
+
+def cmd_kill_proc(argv):
+    if (len(argv) != 3 or not argv[0].isdigit() or not argv[1].isdigit()
+            or argv[2] not in ("TERM", "KILL")):
+        raise Denied("kill-proc takes a pid, its start time and TERM or KILL")
+    pid, start = int(argv[0]), int(argv[1])
+    if pid in (os.getpid(), os.getppid()):
+        raise Denied("refusing to stop Spotlight itself")
+    try:
+        # the pidfd pins this exact process, so a recycled pid can't be hit after the check
+        pidfd = os.pidfd_open(pid)
+    except OSError:
+        notify("Process already gone", "PID %d is no longer running" % pid)
+        raise Denied("process is gone")
+    try:
+        try:
+            owner = os.stat("/proc/%d" % pid).st_uid
+            comm, _cpu, now_start, _rss = _proc_stat(pid)
+        except (OSError, ValueError, IndexError):
+            raise Denied("process is gone")
+        if owner != EUID:
+            raise Denied("not your process")
+        if now_start != start:
+            notify("Process already gone", "PID %d now belongs to another program" % pid)
+            raise Denied("pid was reused")
+        if _protected(comm):
+            raise Denied("protected process")
+        signal.pidfd_send_signal(pidfd, signal.SIGTERM if argv[2] == "TERM" else signal.SIGKILL)
+    finally:
+        os.close(pidfd)
+    emit({"stopped": comm})
+
+
+# ------------------------------------------------------------------- sys:
+def _read_text(path, cap=65536):
+    try:
+        with open(path, "rb") as f:
+            return f.read(cap).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def _bytes_label(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return ("%.0f %s" if unit in ("B", "KB") else "%.1f %s") % (n, unit)
+        n /= 1024.0
+
+
+def cmd_sysinfo():
+    items = []
+
+    def add(key, label, value, copy=None):
+        if value:
+            items.append({"key": key, "label": label, "value": one_line(value, 200),
+                          "copy": one_line(value if copy is None else copy, 200)})
+
+    uname = os.uname()
+    add("host", "Hostname", uname.nodename)
+    release = re.search(r'^PRETTY_NAME="?([^"\n]*)"?', _read_text("/etc/os-release"), re.M)
+    add("os", "OS", release.group(1) if release else "")
+    add("kernel", "Kernel", uname.release)
+    up = _read_text("/proc/uptime").split()
+    if up:
+        minutes = int(float(up[0])) // 60
+        add("uptime", "Uptime", "%dd %dh %dm" % (minutes // 1440, minutes // 60 % 24, minutes % 60))
+    cpu = re.search(r"^model name\s*:\s*(.+)$", _read_text("/proc/cpuinfo", 262144), re.M)
+    add("cpu", "CPU", "%s · %d threads" % (cpu.group(1), os.cpu_count() or 0) if cpu else "")
+    add("load", "Load", " ".join(_read_text("/proc/loadavg").split()[:3]))
+    mem = dict(re.findall(r"^(\w+):\s+(\d+) kB", _read_text("/proc/meminfo"), re.M))
+    if "MemTotal" in mem and "MemAvailable" in mem:
+        total, free = int(mem["MemTotal"]) * 1024, int(mem["MemAvailable"]) * 1024
+        add("memory", "Memory", "%s used of %s (%d%%)" % (_bytes_label(total - free), _bytes_label(total),
+                                                          round((total - free) * 100 / total)))
+    seen = set()
+    for mount in ("/", "/home"):
+        try:
+            vfs = os.statvfs(mount)
+        except OSError:
+            continue
+        # btrfs subvolumes get their own st_dev but share the space
+        if (vfs.f_blocks, vfs.f_bfree) in seen:
+            continue
+        seen.add((vfs.f_blocks, vfs.f_bfree))
+        add("disk:" + mount, "Disk " + mount, "%s free of %s" % (_bytes_label(vfs.f_bavail * vfs.f_frsize),
+                                                              _bytes_label(vfs.f_blocks * vfs.f_frsize)))
+    for battery in sorted(glob.glob("/sys/class/power_supply/BAT*"))[:2]:
+        level = _read_text(battery + "/capacity").strip()
+        state = _read_text(battery + "/status").strip()
+        if level.isdigit():
+            add("battery:" + os.path.basename(battery), "Battery", level + "%" + (" · " + state if state else ""))
+    try:
+        raw, _ = view_output(["ip", "-j", "addr"], 512 * 1024, 3.0, "cannot list addresses")
+        links = json.loads(raw)
+    except (Denied, ValueError):
+        links = []
+    for link in links if isinstance(links, list) else []:
+        name = link.get("ifname") if isinstance(link, dict) else None
+        if not isinstance(name, str) or name.startswith(SYS_SKIP_LINKS):
+            continue
+        for info in link.get("addr_info") or []:
+            local = info.get("local") if isinstance(info, dict) else None
+            if not isinstance(local, str) or info.get("scope") != "global":
+                continue
+            try:
+                address = str(ipaddress.ip_address(local))
+            except ValueError:
+                continue
+            add("ip:" + name + ":" + address, "IP · " + clamp_text(name, 32), address)
+    emit({"items": items})
+
+
+def cmd_public_ip():
+    try:
+        reply = fetch_json("https://api.ipify.org?format=json", 256, 6.0)
+        address = str(ipaddress.ip_address(str(reply.get("ip", ""))))
+    except (OSError, ValueError, AttributeError, Denied):
+        notify("Public IP lookup failed", "Could not reach api.ipify.org")
+        raise Denied("public IP lookup failed")
+    copy_text(address)
+    notify("Public IP copied", address)
+    emit({"ip": address})
+
+
+# ------------------------------------------------------------------- otp:
+def _otp_accounts():
+    fd = walk([".local", "share", "omarchy-totp"])
+    try:
+        data = read_json(fd, "accounts.json", 256 * 1024, None)
+    finally:
+        os.close(fd)
+    accounts = data.get("accounts") if isinstance(data, dict) else None
+    if not isinstance(accounts, list):
+        raise Denied("no 2FA accounts")
+    return [a for a in accounts[:500] if isinstance(a, dict)
+            and isinstance(a.get("id"), str) and OTP_ID_RE.fullmatch(a["id"])]
+
+
+def totp(secret, digits, period, algorithm, now):
+    cleaned = re.sub(r"[\s=-]", "", secret).upper()
+    key = base64.b32decode(cleaned + "=" * (-len(cleaned) % 8))
+    mac = hmac.new(key, struct.pack(">Q", int(now) // period), OTP_HASHES[algorithm]).digest()
+    offset = mac[-1] & 0x0F
+    value = (struct.unpack(">I", mac[offset:offset + 4])[0] & 0x7FFFFFFF) % (10 ** digits)
+    return str(value).zfill(digits)
+
+
+def cmd_otp_accounts():
+    emit({"accounts": [{"id": a["id"], "label": one_line(a.get("label"), 128),
+                        "issuer": one_line(a.get("issuer"), 128)} for a in _otp_accounts()]})
+
+
+def cmd_otp_code(argv):
+    if len(argv) != 2 or not OTP_ID_RE.fullmatch(argv[0]) or argv[1] not in ("copy", "type"):
+        raise Denied("otp-code takes an account id and copy or type")
+    account = next((a for a in _otp_accounts() if a["id"] == argv[0]), None)
+    if account is None:
+        raise Denied("unknown 2FA account")
+    digits = account.get("digits") if account.get("digits") in (6, 7, 8) else 6
+    period = account.get("period")
+    if not isinstance(period, int) or isinstance(period, bool) or not 1 <= period <= 300:
+        period = 30
+    algorithm = re.sub(r"[^A-Z0-9]", "", str(account.get("algorithm") or "SHA1").upper())
+    algorithm = "SHA1" if algorithm == "SHA" else algorithm
+    if algorithm not in OTP_HASHES:
+        raise Denied("unsupported 2FA algorithm")
+    label = one_line(account.get("issuer") or account.get("label"), 128)
+    raw, _, status = run_bounded(["secret-tool", "lookup", "service", "omarchy-totp", "account", argv[0]],
+                                 4096, 10.0, want_status=True)
+    if status != 0 or not raw.strip():
+        notify("2FA code unavailable", "Is the keyring unlocked? " + label)
+        raise Denied("secret unavailable")
+    now = time.time()
+    # a code about to roll over is useless by the time it's pasted
+    if period - now % period < 3:
+        time.sleep(period - now % period + 0.05)
+        now = time.time()
+    try:
+        code = totp(raw.decode("utf-8", "replace").strip(), digits, period, algorithm, now)
+    except (ValueError, TypeError):
+        raise Denied("stored 2FA secret is not valid base32")
+    if argv[1] == "copy":
+        copy_text(code)
+        notify("2FA code copied", label)
+    else:
+        # let the compositor hand focus back to the window underneath first
+        time.sleep(0.35)
+        type_text(code)
+    emit({"done": True})
+
+
+# ------------------------------------------------------------------- k8s:
+def _short_context(name):
+    if name.startswith("gke_"):
+        return name.rsplit("_", 1)[-1]
+    if name.startswith("arn:") and "/" in name:
+        return name.rsplit("/", 1)[-1]
+    return name
+
+
+def cmd_k8s_pods():
+    raw, _ = view_output(["kubectl", "config", "get-contexts", "-o", "name"], 64 * 1024, 5.0,
+                         "kubectl unavailable")
+    contexts = [c for c in raw.decode("utf-8", "replace").split() if K8S_CONTEXT_RE.fullmatch(c)]
+    if not contexts:
+        raise Denied("no kube contexts")
+    rows, failed, partial = [], [], False
+    for context in contexts[:K8S_CONTEXTS]:
+        try:
+            out, truncated = view_output(
+                ["kubectl", "--context=" + context, "--request-timeout=10s", "get", "pods",
+                 "--all-namespaces", "--no-headers", "-o", K8S_COLUMNS],
+                K8S_BYTES, K8S_DEADLINE, "cannot list pods", allow_partial=True)
+        except Denied:
+            failed.append(_short_context(context))
+            continue
+        partial = partial or truncated
+        for line in out.decode("utf-8", "replace").splitlines():
+            parts = line.split()
+            if len(parts) != 8:
+                continue
+            namespace, name, phase, waiting, ready, restarts, started, deleting = parts
+            if not (K8S_NAME_RE.fullmatch(namespace) and K8S_NAME_RE.fullmatch(name)):
+                continue
+            flags = [flag == "true" for flag in ready.split(",")] if ready != "<none>" else []
+            reasons = [w for w in waiting.split(",") if w and w != "<none>"]
+            status = "Terminating" if deleting != "<none>" else (reasons[0] if reasons else phase)
+            count = sum(int(n) for n in restarts.split(",") if n.isdigit())
+            rows.append({
+                "context": context, "cluster": clamp_text(_short_context(context), 64),
+                "namespace": namespace, "name": name, "status": clamp_text(status, 40),
+                "ready": "%d/%d" % (sum(flags), len(flags)), "restarts": count,
+                "started": clamp_text(started, 32) if started != "<none>" else "",
+                "healthy": status == "Succeeded" or (status == "Running" and all(flags)),
+            })
+    if failed and not rows:
+        raise Denied("cannot list pods")
+    rows.sort(key=lambda row: (row["healthy"], row["cluster"], row["namespace"], row["name"]))
+    emit({"pods": rows[:K8S_COUNT], "failed": failed,
+          "partial": partial or bool(failed) or len(rows) > K8S_COUNT})
+
+
+# ------------------------------------------------------------------ jira:
+def _jira_server():
+    fd = walk([".config", ".jira"])
+    try:
+        raw = read_file(fd, ".config.yml", 256 * 1024)
+    finally:
+        os.close(fd)
+    for line in (raw or b"").decode("utf-8", "replace").splitlines():
+        match = JIRA_SERVER_RE.match(line)
+        if match:
+            return match.group(1)
+    raise Denied("no Jira server in the jira-cli config")
+
+
+def cmd_jira_server():
+    emit({"server": _jira_server()})
+
+
+def _jira_env():
+    """The token lives in ~/.bashrc, which a Hyprland-started shell never reads; hand it to jira only."""
+    if os.environ.get("JIRA_API_TOKEN"):
+        return None
+    fd = home_fd()
+    try:
+        raw = read_file(fd, ".bashrc", 1024 * 1024)
+    except Denied:
+        raw = None
+    finally:
+        os.close(fd)
+    token = None
+    for line in (raw or b"").decode("utf-8", "replace").splitlines():
+        match = JIRA_TOKEN_RE.match(line)
+        if match:
+            token = next(group for group in match.groups() if group is not None)
+    if not token:
+        return None
+    env = dict(os.environ)
+    env["JIRA_API_TOKEN"] = token
+    return env
+
+
+def cmd_jira_issues():
+    server = _jira_server()
+    env = _jira_env()
+    try:
+        raw, _ = view_output(["jira", "issue", "list", "--raw", "--paginate", "0:100",
+                              "--order-by", "updated", "-q", JIRA_JQL],
+                             JIRA_BYTES, JIRA_DEADLINE, "Jira CLI unavailable", env=env)
+    except Denied:
+        if env is None and not os.environ.get("JIRA_API_TOKEN"):
+            raise Denied("no JIRA_API_TOKEN in Spotlight's environment or ~/.bashrc")
+        raise
+    try:
+        items = json.loads(raw)
+    except ValueError:
+        raise Denied("invalid Jira output")
+    rows = []
+    for item in items if isinstance(items, list) else []:
+        key = item.get("key") if isinstance(item, dict) else None
+        if not isinstance(key, str) or not JIRA_KEY_RE.fullmatch(key):
+            continue
+        fields = item.get("fields") if isinstance(item.get("fields"), dict) else {}
+
+        def name_of(field):
+            value = fields.get(field)
+            return one_line(value.get("name"), 60) if isinstance(value, dict) else ""
+
+        rows.append({"key": key, "summary": one_line(fields.get("summary"), 300),
+                     "status": name_of("status"), "type": name_of("issueType"),
+                     "priority": name_of("priority"),
+                     # jira says -0400, Date.parse wants -04:00
+                     "updated": re.sub(r"([+-]\d\d)(\d\d)$", r"\1:\2", clamp_text(fields.get("updated"), 40)),
+                     "url": server + "/browse/" + key})
+    emit({"issues": rows})
+
+
+# ------------------------------------------------------------- time zones
+def _tz_names():
+    from zoneinfo import available_timezones
+    names = {}
+    for zone in available_timezones():
+        if "/" in zone and not zone.startswith(("Etc/", "SystemV/")):
+            names.setdefault(zone.rsplit("/", 1)[1].replace("_", " ").lower(), zone)
+        names.setdefault(zone.lower(), zone)
+    return names
+
+
+def _tz_zone(text, names):
+    from zoneinfo import ZoneInfo
+    key = re.sub(r"\s+", " ", text.strip().lower()).removeprefix("the ")
+    zone = TZ_ALIASES.get(key) or names.get(key)
+    if not zone:
+        return None, ""
+    label = key.upper() if key in TZ_ALIASES and len(key) <= 4 else (
+        text.strip().title() if key in TZ_ALIASES else zone.rsplit("/", 1)[-1].replace("_", " "))
+    return ZoneInfo(zone), label
+
+
+def _tz_offset(moment):
+    minutes = int(moment.utcoffset().total_seconds() // 60)
+    sign = "+" if minutes >= 0 else "\u2212"
+    hours, rest = divmod(abs(minutes), 60)
+    return "UTC" + sign + str(hours) + (":%02d" % rest if rest else "")
+
+
+def _tz_clock(text):
+    text = text.strip().lower()
+    if text in ("noon", "midnight"):
+        return (12 if text == "noon" else 0), 0
+    m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", text)
+    hour, minute = int(m.group(1)), int(m.group(2) or 0)
+    if m.group(3):
+        if not 1 <= hour <= 12:
+            return None
+        hour = hour % 12 + (12 if m.group(3) == "pm" else 0)
+    return (hour, minute) if hour < 24 and minute < 60 else None
+
+
+def cmd_tz(argv):
+    if len(argv) != 1:
+        raise Denied("tz takes one query")
+    query = re.sub(r"\s+", " ", clamp_text(argv[0], TZ_QUERY_CHARS).strip().lower())
+    names = _tz_names()
+    local = datetime.now().astimezone()
+    m = (re.fullmatch(r"(?:what )?(?:time|now|clock)(?: is it)? (?:in|at) (.+)", query)
+         or re.fullmatch(r"(.+?) time", query))
+    if m:
+        zone, label = _tz_zone(m.group(1), names)
+        if zone is None:
+            emit({"result": None})
+            return
+        there = local.astimezone(zone)
+        emit({"result": {
+            "title": there.strftime("%H:%M") + " in " + label,
+            "subtitle": there.strftime("%a %b %-d") + " · " + _tz_offset(there) + " · "
+                        + _tz_gap(there, local),
+            "copy": there.strftime("%H:%M")}})
+        return
+    m = re.fullmatch(TZ_CLOCK + r"(?: (.+?))? (?:in|to) (.+)", query)
+    clock = _tz_clock(m.group(1)) if m else None
+    if not clock:
+        emit({"result": None})
+        return
+    source, source_label = _tz_zone(m.group(2), names) if m.group(2) else (local.tzinfo, "local")
+    target, target_label = _tz_zone(m.group(3), names)
+    if source is None or target is None:
+        emit({"result": None})
+        return
+    start = local.astimezone(source).replace(hour=clock[0], minute=clock[1], second=0, microsecond=0)
+    there = start.astimezone(target)
+    shift = (there.date() - start.date()).days
+    emit({"result": {
+        "title": there.strftime("%H:%M") + " in " + target_label
+                 + ("" if not shift else " (" + there.strftime("%a") + ")"),
+        "subtitle": start.strftime("%H:%M") + " " + source_label + " (" + _tz_offset(start) + ") \u2192 "
+                    + target_label + " (" + _tz_offset(there) + ")",
+        "copy": there.strftime("%H:%M")}})
+
+
+def _tz_gap(there, local):
+    minutes = int((there.utcoffset() - local.utcoffset()).total_seconds() // 60)
+    if minutes == 0:
+        return "same as here"
+    hours, rest = divmod(abs(minutes), 60)
+    return str(hours) + ("h%02d" % rest if rest else "h") + (" ahead" if minutes > 0 else " behind")
+
+
+def cmd_uuids():
+    import uuid
+    emit({"uuids": [str(uuid.uuid4()) for _ in range(5)]})
 
 
 def service_snapshot():
@@ -3621,6 +4259,18 @@ COMMANDS = {
     "docker": (cmd_docker, False),
     "gh-repos": (cmd_gh_repos, False),
     "gh-prs": (cmd_gh_prs, False),
+    "local-repos": (cmd_local_repos, False),
+    "procs": (cmd_procs, False),
+    "kill-proc": (cmd_kill_proc, True),
+    "sysinfo": (cmd_sysinfo, False),
+    "public-ip": (cmd_public_ip, False),
+    "otp-accounts": (cmd_otp_accounts, False),
+    "otp-code": (cmd_otp_code, True),
+    "k8s-pods": (cmd_k8s_pods, False),
+    "jira-server": (cmd_jira_server, False),
+    "jira-issues": (cmd_jira_issues, False),
+    "tz": (cmd_tz, True),
+    "uuids": (cmd_uuids, False),
     "services": (cmd_services, False),
     "mounts": (cmd_mounts, False),
     "audio": (cmd_audio, False),

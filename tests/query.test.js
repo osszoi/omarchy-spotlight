@@ -56,7 +56,7 @@ test("empty filters are hints, not unscoped searches", () => {
 
 test("view prefixes offer completions without replacing filtered queries", () => {
   assert.deepEqual(Query.viewCompletions("port"), ["ports"])
-  assert.deepEqual(Query.viewCompletions("s"), ["ssh", "services"])
+  assert.deepEqual(Query.viewCompletions("s"), ["ssh", "services", "sys"])
   assert.deepEqual(Query.viewCompletions("dock:"), ["docker"])
   assert.deepEqual(Query.viewCompletions("moun"), ["mounts"])
   assert.deepEqual(Query.viewCompletions("aud"), ["audio"])

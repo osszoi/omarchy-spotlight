@@ -17,9 +17,13 @@ const root = {
   helperArgv: args => ['python3', 'spotlight-helper', ...args]
 };
 for (const name of ['resetFolders', 'leaveSettingsPanel', 'stopCurrencyProcess', 'stopPreviewProcess', 'resetView', 'updateCurrency', 'syncView', 'refreshPluginCommands',
-    'rebuild', 'refreshSettings', 'refreshReminders', 'refreshToggleStates', 'resumeTour']) root[name] = noop;
+    'rebuild', 'refreshSettings', 'refreshReminders', 'refreshToggleStates', 'resumeTour', 'refreshJiraServer',
+    'refreshUuids']) root[name] = noop;
+root.devClipboard = {forQuery: ''};
+root.tzResult = {forQuery: '', result: null};
 const context = vm.createContext({root, Query: require('../lib/Query.js'), Currency: require('../lib/Currency.js'),
   Resume: require('../lib/Resume.js'), Placeholders: require('../lib/Placeholders.js'),
+  DevTools: require('../lib/DevTools.js'), DateMath: require('../lib/DateMath.js'),
   Style: {space: value => value}, panel: {width: 1920}, placeholderMetrics: {advanceWidth: text => text.length * 10},
   WeatherIntent: require('../lib/WeatherIntent.js'), Web: require('../lib/Web.js'),
   Qt: {callLater: fn => fn()}, Util: {execArgv: argv => notifications.push(Array.from(argv))},
@@ -32,7 +36,8 @@ const context = vm.createContext({root, Query: require('../lib/Query.js'), Curre
 for (const name of ['currencyDebounce', 'suggestDebounce', 'fileDebounce', 'clipboardDebounce', 'tldrDebounce',
     'previewDebounce', 'typingGuard'])
   context[name] = {stop: noop, restart: noop};
-for (const name of ['suggestProc', 'fileProc', 'clipboardProc', 'tldrProc']) context[name] = {running: false};
+for (const name of ['suggestProc', 'fileProc', 'clipboardProc', 'tldrProc', 'devClipProc']) context[name] = {running: false};
+context.tzDebounce = {stop: noop, restart: noop};
 for (const name of ['open', 'close', 'finishClose', 'stopQueryWork', 'stopAi', 'startAi', 'handleAiLine', 'notifyAiFinished',
     'failAi', 'helperReply', 'helperError', 'loadSettings']) {
   const match = source.match(new RegExp('^  function ' + name + '\\((.*?)\\) \\{\\n([\\s\\S]*?)^  \\}', 'm'));

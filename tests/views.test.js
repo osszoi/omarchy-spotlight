@@ -196,3 +196,64 @@ test("ago reads like a person would say it", () => {
   assert.equal(Views.ago("2021-05-07T01:52:09Z", now), "5y ago")
   assert.equal(Views.ago("", now), "")
 })
+
+test("repo: filters by folder and name, Enter opens a terminal there", () => {
+  const repos = [
+    { name: "fe-admin", path: "/home/u/Work/dawere/fe-admin", where: "Work/dawere", branch: "main", active: 1790000000 },
+    { name: "omarchy-spotlight", path: "/home/u/Work/personal/omarchy-spotlight", where: "Work/personal", branch: "main", active: 1780000000 }
+  ]
+  assert.deepEqual(rows("repo", ready(repos), "personal/").map(r => r.title), ["omarchy-spotlight"])
+  const [first] = rows("repo", ready(repos))
+  assert.deepEqual(Views.action("repo", first.payload, false), { terminalAt: "/home/u/Work/dawere/fe-admin" })
+  assert.deepEqual(Views.action("repo", first.payload, true), { copy: "/home/u/Work/dawere/fe-admin" })
+})
+
+test("k8s: follows logs with the pod's own context, never the current one", () => {
+  const pods = [{ context: "gke_x_us-east1_prod-cluster", cluster: "prod-cluster", namespace: "default", name: "api-7d9",
+                  status: "CrashLoopBackOff", ready: "0/1", restarts: 12, started: "2026-10-10T12:00:00Z", healthy: false }]
+  const [pod] = rows("k8s", ready(pods), "crash")
+  assert.equal(pod.accessory, "CrashLoopBackOff")
+  assert.match(pod.subtitle, /^prod-cluster · default · 0\/1 ready · 12 restarts · /)
+  assert.deepEqual(Views.action("k8s", pod.payload, false).terminal.slice(0, 3),
+    ["kubectl", "--context=gke_x_us-east1_prod-cluster", "--namespace=default"])
+  assert.deepEqual(Views.action("k8s", pod.payload, true), { copy: "api-7d9" })
+})
+
+test("kill: rows need a second Enter and carry the start time", () => {
+  const procs = [{ pid: 4242, start: 99, name: "chrome", cpu: 12.5, rss: 524288000, args: "/opt/chrome --type=gpu" }]
+  const [proc] = rows("kill", ready(procs), "chrome")
+  assert.equal(proc.confirm, true)
+  assert.equal(proc.accessory, "13% CPU")
+  assert.deepEqual(Views.action("kill", proc.payload, false), { helper: ["kill-proc", "4242", "99", "TERM"] })
+  assert.deepEqual(Views.action("kill", proc.payload, true), { helper: ["kill-proc", "4242", "99", "KILL"] })
+  assert.equal(rows("kill", ready(procs), "4242")[0].title, "chrome")
+})
+
+test("sys: copies values and always offers the public IP lookup", () => {
+  const items = [{ key: "host", label: "Hostname", value: "box", copy: "box" }]
+  const all = rows("sys", ready(items))
+  assert.deepEqual(all.map(r => r.title), ["box", "Public IP"])
+  assert.deepEqual(Views.action("sys", all[0].payload), { copy: "box" })
+  assert.deepEqual(Views.action("sys", all[1].payload), { helper: ["public-ip"] })
+  assert.deepEqual(rows("sys", ready(items), "ip").map(r => r.title), ["Public IP"])
+  assert.deepEqual(rows("sys", ready(items), "host").map(r => r.title), ["box"])
+})
+
+test("otp: lists names only and asks the helper for the code", () => {
+  const [account] = rows("otp", ready([{ id: "a1", label: "osszoi", issuer: "GitHub" }]), "git")
+  assert.equal(account.title, "GitHub")
+  assert.ok(!/\d{6}/.test(account.title + account.subtitle))
+  assert.deepEqual(Views.action("otp", account.payload, false), { helper: ["otp-code", "a1", "copy"] })
+  assert.deepEqual(Views.action("otp", account.payload, true), { helper: ["otp-code", "a1", "type"] })
+})
+
+test("jira: opens a typed key even when the list could not load", () => {
+  const server = "https://example.atlassian.net"
+  const failed = rows("jira", { state: "error", error: "JIRA_API_TOKEN is not set for Spotlight", server }, "abc-12")
+  assert.deepEqual(failed.map(r => r.title), ["Open ABC-12", "JIRA_API_TOKEN is not set for Spotlight"])
+  assert.deepEqual(Views.action("jira", failed[0].payload, false), { url: server + "/browse/ABC-12" })
+  const issues = [{ key: "ABC-12", summary: "Fix login", status: "To Do", type: "Bug", priority: "High",
+                    updated: "2026-10-09T05:24:10.130-04:00", url: server + "/browse/ABC-12" }]
+  assert.deepEqual(rows("jira", { state: "ready", entries: issues, server }, "abc-12").map(r => r.title), ["Fix login"])
+  assert.equal(rows("jira", { state: "ready", entries: issues }, "zzz-1")[0].title, "No matching open Jira issues")
+})

@@ -275,7 +275,8 @@ function overlay() {
     rows: [], indexOfKey(key) { return this.rows.findIndex(row => row.key === key) },
     bumpUsage() {}, dismiss() { this.opened = false; this.pendingCurrency = null },
     copyCalls: [],
-    stopCurrencyProcess() { this.stops++ }, stops: 0 }
+    stopCurrencyProcess() { this.stops++ }, stops: 0,
+    uuidPool: [], devClipboard: { forQuery: "" }, tzResult: { forQuery: "", result: null }, jiraServer: "" }
   const timer = { running: false, stop() { this.running = false }, restart() { this.running = true } }
   const context = vm.createContext({ root, currencyDebounce: timer,
     suggestDebounce: { stop() {} }, suggestProc: { running: false }, Currency, Query, Units,
@@ -283,7 +284,8 @@ function overlay() {
       execArgv: argv => root.copyCalls.push(argv) },
     Date: { now: () => NOW }, Calc: { evaluate: () => null },
     NaturalTime: { parseReminder: () => null, parseEvent: () => null },
-    Web: { detectUrl: () => "", canonicalEngine: key => key }, Fuzzy: { MATCH_EXACT: 100 } })
+    Web: { detectUrl: () => "", canonicalEngine: key => key }, Fuzzy: { MATCH_EXACT: 100 },
+    DevTools: { parse: () => [] }, Colors: { rows: () => [] }, DateMath: { parse: () => [] } })
   for (const name of ["currencyQuery", "intentRows", "updateCurrency", "loadCurrency",
     "loadSettings", "setupPending", "loadSuggestions", "activate"]) {
     const source = qml.match(new RegExp("  function " + name + "\\([^]*?\\n  }"))[0]

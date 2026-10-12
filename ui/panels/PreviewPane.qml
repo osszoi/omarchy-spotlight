@@ -98,10 +98,25 @@ Item {
             : modelData.type === "image" ? imageBlock
             : modelData.type === "window" ? windowBlock
             : modelData.type === "meta" ? metaBlock
-            : modelData.type === "status" ? statusBlock : null
+            : modelData.type === "status" ? statusBlock
+            : modelData.type === "swatch" ? swatchBlock : null
           onLoaded: item.block = modelData
         }
       }
+    }
+  }
+
+  Component {
+    id: swatchBlock
+    Rectangle {
+      property var block: ({})
+      implicitHeight: Style.space(96)
+      radius: Style.space(8)
+      // a checkerboard would be nicer, the hairline at least shows where a see-through color ends
+      color: /^#[0-9a-fA-F]{6}$/.test(String(block.color || "")) ? block.color : "transparent"
+      opacity: isFinite(block.alpha) ? Math.max(0.05, block.alpha) : 1
+      border.width: Style.spacing.hairline
+      border.color: Util.alpha(pane.foreground, 0.2)
     }
   }
 

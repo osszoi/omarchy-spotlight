@@ -17,6 +17,18 @@ Fork of [maajix/omarchy-spotlight](https://github.com/maajix/omarchy-spotlight) 
 - `gh:` lists your and your orgs' GitHub repos (`gh: api` keeps names containing "api") and `pr:`
   lists their open pull requests; both use the GitHub CLI you're already signed in to and show the
   last list instantly while refreshing
+- `repo:` (git repos under ~/Work, Enter opens a terminal there), `k8s:` (pods across your kube
+  contexts, read-only, Enter follows logs with `--context` so your current context never changes),
+  `kill:` (busiest processes first, every kill needs a second Enter, session processes are never
+  listed), `sys:` (IPs, memory, disk, battery; Public IP is looked up only when you press Enter),
+  `otp:` (codes from the 2FA bar plugin, only names are listed, Enter copies and Shift+Enter types)
+- `jira:` lists your open issues and `jira: ABC-123` (or just `ABC-123`) opens one, via jira-cli.
+  Spotlight starts from Hyprland, not your shell, so when `JIRA_API_TOKEN` isn't in its environment
+  the helper reads a plain `export JIRA_API_TOKEN="..."` line from `~/.bashrc` and hands it to
+  jira-cli only; opening by key needs no token
+- Inline answers: `uuid`, `b64`/`b64d`, `url`/`urld`, `jwt` and `json` (alone they read the
+  clipboard), Unix timestamps, colors (`#ff8800`, `rgb()`, `hsl()`, plus a Pick Color command),
+  `time in tokyo`, `3pm est in caracas`, `days until dec 24`, `today + 45 days`
 
 The website and documentation below are upstream's.
 

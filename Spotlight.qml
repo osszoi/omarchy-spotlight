@@ -27,6 +27,9 @@ import "lib/WeatherIntent.js" as WeatherIntent
 import "lib/Cheatsheet.js" as Cheatsheet
 import "lib/Resume.js" as Resume
 import "lib/Placeholders.js" as Placeholders
+import "lib/DevTools.js" as DevTools
+import "lib/Colors.js" as Colors
+import "lib/DateMath.js" as DateMath
 
 // Spotlight — a Raycast-shaped command palette for Omarchy.
 //
@@ -262,6 +265,12 @@ Item {
   property string viewNote: ""
   // last good list of the slow views (gh:, pr:), memory only, shown while they refresh
   property var viewCache: ({})
+  property string viewError: ""
+  property string jiraServer: ""
+  property var uuidPool: []
+  // only ever holds the clipboard for the jwt/json/b64d/urld query that asked for it
+  property var devClipboard: ({ forQuery: "", text: undefined })
+  property var tzResult: ({ forQuery: "", result: null })
   property var currencySession: Currency.createSession()
   property var currencyProcess: null
   property var pendingCurrency: null
@@ -506,6 +515,8 @@ Item {
     // up an edit just as promptly.
     root.refreshSettings()
     root.refreshReminders()
+    root.refreshJiraServer()
+    root.refreshUuids()
     root.refreshToggleStates()
     root.syncView(Query.parse(root.query).filter)
     root.updateCurrency()
@@ -658,6 +669,19 @@ Item {
     var reply = root.helperReply(raw)
     root.pluginCommands = Commands.fromPlugins(reply ? reply.plugins : [], root.pluginId)
     if (root.opened) root.rebuild()
+  }
+
+  function refreshUuids() {
+    uuidProc.running = false
+    uuidProc.command = root.helperArgv(["uuids"])
+    uuidProc.running = true
+  }
+
+  // read once, it only names the server, the token stays with jira-cli
+  function refreshJiraServer() {
+    if (root.jiraServer || jiraServerProc.running) return
+    jiraServerProc.command = root.helperArgv(["jira-server"])
+    jiraServerProc.running = true
   }
 
   function refreshReminders() {
@@ -1241,6 +1265,36 @@ Item {
       }))
     }
 
+    if (!filter) {
+      var extras = DevTools.parse(q, {
+        now: Date.now(), uuid: root.uuidPool.length ? root.uuidPool[0] : "",
+        clipboard: root.devClipboard.forQuery === q ? root.devClipboard.text : undefined
+      }).concat(Colors.rows(q), DateMath.parse(q, Date.now(), NaturalTime.parseWhen))
+      if (root.tzResult.forQuery === q && root.tzResult.result) {
+        var tz = root.tzResult.result
+        extras.push({ key: "date.tz", title: tz.title, subtitle: tz.subtitle, copy: tz.copy,
+                      accessory: "Time", icon: "\uDB80\uDD50" })
+      }
+      for (var x = 0; x < extras.length; x++) {
+        var extra = extras[x]
+        out.push(root.row({
+          key: extra.key, kind: extra.error ? "noop" : "copy", title: extra.title, subtitle: extra.subtitle,
+          accessory: extra.accessory, icon: extra.icon, mono: true, primaryLabel: extra.error ? "" : "Copy",
+          payload: { text: extra.copy, detail: extra.detail || "", swatch: extra.swatch || "",
+                     alpha: extra.alpha, formats: extra.formats || null }
+        }))
+      }
+      var jiraKey = q.trim().toUpperCase()
+      if (root.jiraServer && /^[A-Z][A-Z0-9]{1,9}-[0-9]{1,7}$/.test(jiraKey)) {
+        out.push(root.row({
+          key: "jira.open:" + jiraKey, kind: "url", title: "Open " + jiraKey + " in Jira",
+          subtitle: root.jiraServer.replace(/^https:\/\//, "") + "/browse/" + jiraKey,
+          accessory: "Jira", icon: "\uDB80\uDF03", primaryLabel: "Open issue",
+          payload: { url: root.jiraServer + "/browse/" + jiraKey }
+        }))
+      }
+    }
+
     var url = (!filter || filter === "web") ? Web.detectUrl(q) : ""
     if (url) {
       out.push(root.row({
@@ -1481,7 +1535,8 @@ Item {
   // lib/Views.js builds and ranks the rows; this only fills in row defaults.
   function viewResultRows(name, q) {
     var specs = Views.rows(name, Query.viewDetails(name),
-      { state: root.viewState, entries: root.viewRows, partial: root.viewPartial, note: root.viewNote },
+      { state: root.viewState, entries: root.viewRows, partial: root.viewPartial, note: root.viewNote,
+        error: root.viewError, server: root.jiraServer },
       q, Fuzzy.match)
     var out = []
     for (var i = 0; i < specs.length; i++) out.push(root.row(specs[i]))
@@ -1938,6 +1993,8 @@ Item {
     else if (step.url) root.openUrl(step.url)
     else if (step.path) root.openPath(step.path)
     else if (step.terminal) root.openHeldTerminal(step.terminal, step.holdIf)
+    else if (step.terminalAt) Util.execArgv(["setsid", "uwsm-app", "--", "xdg-terminal-exec", "--dir=" + step.terminalAt])
+    else if (step.helper) Util.execArgv(root.helperArgv(step.helper))
     else if (step.argv) Util.execArgv(step.argv)
   }
 
@@ -2313,6 +2370,7 @@ Item {
     root.viewRows = []
     root.viewPartial = false
     root.viewNote = ""
+    root.viewError = ""
     root.viewState = name ? "loading" : "idle"
     var cached = name ? root.viewCache[name] : null
     if (cached) {
@@ -2345,6 +2403,7 @@ Item {
       } else {
         root.viewRows = []
         root.viewState = "error"
+        root.viewError = root.helperError(raw)
       }
     } else {
       root.viewRows = reply[details.field].slice(0, details.limit || root.maxViewEntries)
@@ -2520,6 +2579,25 @@ Item {
       clipboardDebounce.stop()
       if (root.clipboardRows.length > 0) root.clipboardRows = []
       root.clipboardFor = ""
+    }
+
+    if (!parsed.filter && DevTools.wantsClipboard(q)) {
+      if (root.devClipboard.forQuery !== q) {
+        root.devClipboard = { forQuery: q, text: undefined }
+        devClipProc.running = false
+        devClipProc.forQuery = q
+        devClipProc.running = true
+      }
+    } else if (root.devClipboard.forQuery) {
+      root.devClipboard = { forQuery: "", text: undefined }
+    }
+
+    if (!parsed.filter && DateMath.isTimeZoneQuery(q)) {
+      tzDebounce.forQuery = q
+      tzDebounce.restart()
+    } else {
+      tzDebounce.stop()
+      if (root.tzResult.forQuery) root.tzResult = { forQuery: "", result: null }
     }
 
     // Any query change drops the page; loadTldr only stores a reply for the current query.
@@ -2825,6 +2903,70 @@ Item {
   }
 
   Process { id: clipCopyProc }
+
+  Process {
+    id: uuidProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var reply = root.helperReply(text)
+        if (!reply || !Array.isArray(reply.uuids)) return
+        root.uuidPool = reply.uuids.filter(function(u) { return /^[0-9a-f-]{36}$/.test(u) })
+        if (root.opened) root.rebuild()
+      }
+    }
+  }
+
+  Process {
+    id: devClipProc
+    property string forQuery: ""
+    command: ["wl-paste", "--no-newline", "--type", "text"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (devClipProc.forQuery !== String(root.query || "").trim()) return
+        root.devClipboard = { forQuery: devClipProc.forQuery, text: text.slice(0, 65536) }
+        root.rebuild()
+      }
+    }
+  }
+
+  Timer {
+    id: tzDebounce
+    interval: 200
+    property string forQuery: ""
+    onTriggered: {
+      tzProc.running = false
+      tzProc.forQuery = tzDebounce.forQuery
+      tzProc.command = root.helperArgv(["tz", tzDebounce.forQuery])
+      tzProc.running = true
+    }
+  }
+
+  Process {
+    id: tzProc
+    property string forQuery: ""
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (tzProc.forQuery !== String(root.query || "").trim()) return
+        var reply = root.helperReply(text)
+        root.tzResult = { forQuery: tzProc.forQuery, result: reply && reply.result ? reply.result : null }
+        root.rebuild()
+      }
+    }
+  }
+
+  Process {
+    id: jiraServerProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var reply = root.helperReply(text)
+        if (reply && /^https:\/\/[A-Za-z0-9.-]+/.test(reply.server || "")) root.jiraServer = reply.server
+      }
+    }
+  }
 
   Process {
     id: remindersProc

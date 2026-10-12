@@ -3232,5 +3232,205 @@ class CurrencyRatesTests(unittest.TestCase):
         self.assertEqual(list(records), ["USD"])
 
 
+
+class LauncherViewTests(unittest.TestCase):
+    def test_totp_matches_the_rfc_6238_vectors(self):
+        import base64
+        for algorithm, key, expected in (("SHA1", b"12345678901234567890", "94287082"),
+                                         ("SHA256", b"12345678901234567890123456789012", "46119246"),
+                                         ("SHA512", b"1234567890123456789012345678901234567890123456789012345678901234",
+                                          "90693936")):
+            secret = base64.b32encode(key).decode().rstrip("=").lower()
+            self.assertEqual(HELPER.totp(secret, 8, 30, algorithm, 59), expected, algorithm)
+
+    def test_otp_code_feeds_the_code_on_stdin_never_argv(self):
+        import base64
+        account = {"id": "a1", "label": "osszoi", "issuer": "GitHub", "digits": 6, "period": 30, "algorithm": "SHA1"}
+        secret = base64.b32encode(b"12345678901234567890")
+        fed = []
+        for mode, program in (("copy", ["wl-copy"]), ("type", ["wtype", "-"])):
+            fed.clear()
+            with mock.patch.object(HELPER, "_otp_accounts", return_value=[account]), \
+                    mock.patch.object(HELPER, "run_bounded", return_value=(secret + b"\n", False, 0)) as lookup, \
+                    mock.patch.object(HELPER, "_feed", side_effect=lambda argv, text: fed.append((argv, text))), \
+                    mock.patch.object(HELPER, "notify"), \
+                    mock.patch.object(HELPER.time, "time", return_value=50.0), \
+                    mock.patch.object(HELPER.time, "sleep"):
+                run(HELPER.cmd_otp_code, ["a1", mode])
+            self.assertEqual(lookup.call_args.args[0],
+                             ["secret-tool", "lookup", "service", "omarchy-totp", "account", "a1"])
+            self.assertEqual(fed, [(program, HELPER.totp(secret.decode(), 6, 30, "SHA1", 50))])
+        for argv in (["a1"], ["../x", "copy"], ["a1", "print"]):
+            with self.assertRaises(HELPER.Denied):
+                HELPER.cmd_otp_code(argv)
+
+    def test_otp_waits_out_a_code_about_to_roll_over(self):
+        import base64
+        account = {"id": "a1", "label": "x", "issuer": "", "digits": 6, "period": 30, "algorithm": "SHA1"}
+        clock = [58.5]
+        with mock.patch.object(HELPER, "_otp_accounts", return_value=[account]), \
+                mock.patch.object(HELPER, "run_bounded", return_value=(base64.b32encode(b"k" * 20), False, 0)), \
+                mock.patch.object(HELPER, "_feed") as feed, mock.patch.object(HELPER, "notify"), \
+                mock.patch.object(HELPER.time, "time", side_effect=lambda: clock[0]), \
+                mock.patch.object(HELPER.time, "sleep", side_effect=lambda s: clock.__setitem__(0, clock[0] + s)):
+            run(HELPER.cmd_otp_code, ["a1", "copy"])
+        self.assertEqual(feed.call_args.args[1],
+                         HELPER.totp(base64.b32encode(b"k" * 20).decode(), 6, 30, "SHA1", 60.05))
+
+    def test_otp_accounts_lists_names_from_the_plugin_index(self):
+        with fake_home() as home:
+            folder = home / ".local" / "share" / "omarchy-totp"
+            folder.mkdir(parents=True, mode=0o700)
+            for part in (home / ".local", home / ".local" / "share"):
+                part.chmod(0o700)
+            (folder / "accounts.json").write_text(json.dumps({"version": 1, "accounts": [
+                {"id": "a1", "label": "osszoi", "issuer": "GitHub", "digits": 6},
+                {"id": "bad id!", "label": "x"}]}))
+            reply = run(HELPER.cmd_otp_accounts)
+        self.assertEqual(reply["accounts"], [{"id": "a1", "label": "osszoi", "issuer": "GitHub"}])
+
+    def test_kill_refuses_protected_recycled_and_malformed_targets(self):
+        self.assertTrue(HELPER._protected("Hyprland"))
+        self.assertTrue(HELPER._protected("omarchy-system-"))
+        self.assertTrue(HELPER._protected("xdg-desktop-por"))
+        self.assertFalse(HELPER._protected("chrome"))
+        for argv in (["1"], ["x", "1", "TERM"], ["1", "1", "HUP"]):
+            with self.assertRaises(HELPER.Denied):
+                HELPER.cmd_kill_proc(argv)
+        uid = mock.Mock(st_uid=HELPER.EUID)
+        for comm, start in (("Hyprland", 7), ("chrome", 8)):
+            with mock.patch.object(HELPER.os, "pidfd_open", return_value=99), \
+                    mock.patch.object(HELPER.os, "close"), \
+                    mock.patch.object(HELPER.os, "stat", return_value=uid), \
+                    mock.patch.object(HELPER, "_proc_stat", return_value=(comm, 0, start, 0)), \
+                    mock.patch.object(HELPER, "notify"), \
+                    mock.patch.object(HELPER.signal, "pidfd_send_signal") as send:
+                with self.assertRaises(HELPER.Denied):
+                    HELPER.cmd_kill_proc(["4242", "7", "TERM"])
+            send.assert_not_called()
+
+    def test_kill_signals_through_the_pidfd(self):
+        uid = mock.Mock(st_uid=HELPER.EUID)
+        with mock.patch.object(HELPER.os, "pidfd_open", return_value=99), mock.patch.object(HELPER.os, "close"), \
+                mock.patch.object(HELPER.os, "stat", return_value=uid), \
+                mock.patch.object(HELPER, "_proc_stat", return_value=("chrome", 0, 7, 0)), \
+                mock.patch.object(HELPER.signal, "pidfd_send_signal") as send:
+            reply = run(HELPER.cmd_kill_proc, ["4242", "7", "KILL"])
+        send.assert_called_once_with(99, HELPER.signal.SIGKILL)
+        self.assertEqual(reply["stopped"], "chrome")
+
+    def test_procs_lists_this_users_processes_without_the_protected_ones(self):
+        with mock.patch.object(HELPER, "PROC_SAMPLE", 0.01):
+            reply = run(HELPER.cmd_procs)
+        names = {p["name"] for p in reply["processes"]}
+        self.assertFalse(names & HELPER.PROC_PROTECTED)
+        self.assertNotIn(os.getpid(), [p["pid"] for p in reply["processes"]])
+
+    def test_local_repos_finds_repos_newest_first_and_skips_heavy_folders(self):
+        with fake_home() as home:
+            for rel, stamp in (("Work/old", 1000), ("Work/team/new", 2000),
+                               ("Work/web/node_modules/dep", 3000), ("Work/a/b/c/d/too-deep", 4000)):
+                git = home / rel / ".git"
+                git.mkdir(parents=True)
+                (git / "HEAD").write_text("ref: refs/heads/main\n")
+                os.utime(git / "HEAD", (stamp, stamp))
+            reply = run(HELPER.cmd_local_repos)
+        self.assertEqual([(r["name"], r["where"], r["branch"]) for r in reply["repos"]],
+                         [("new", "Work/team", "main"), ("old", "Work", "main")])
+
+    def test_k8s_lists_pods_per_context_broken_first(self):
+        pods = (
+            "default   api-1   Running   <none>             true,true   0,1   2026-10-10T00:00:00Z   <none>\n"
+            "default   api-2   Running   CrashLoopBackOff   false       12    2026-10-10T00:00:00Z   <none>\n"
+            "-bad      x       Running   <none>             true        0     <none>                 <none>\n"
+        ).encode()
+        replies = [(b"gke_p_us-east1_dev-cluster\n--evil\ngke_p_us-east1_prod-cluster\n", False),
+                   (pods, False), HELPER.Denied("down")]
+
+        def fake(argv, cap, deadline, message, allow_partial=False):
+            reply = replies.pop(0)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+        with mock.patch.object(HELPER, "view_output", side_effect=fake) as view:
+            reply = run(HELPER.cmd_k8s_pods)
+        self.assertEqual(view.call_args_list[1].args[0][1], "--context=gke_p_us-east1_dev-cluster")
+        self.assertEqual([(p["name"], p["status"], p["restarts"], p["ready"]) for p in reply["pods"]],
+                         [("api-2", "CrashLoopBackOff", 12, "0/1"), ("api-1", "Running", 1, "2/2")])
+        self.assertEqual(reply["pods"][0]["cluster"], "dev-cluster")
+        self.assertEqual(reply["failed"], ["prod-cluster"])
+        self.assertTrue(reply["partial"])
+
+    def test_jira_reads_the_server_and_builds_issue_urls(self):
+        issues = [{"key": "ABC-12", "fields": {"summary": "Fix login", "status": {"name": "To Do"},
+                                               "issueType": {"name": "Bug"}, "priority": {"name": "High"},
+                                               "updated": "2026-10-09T05:24:10.130-0400"}},
+                  {"key": "not a key", "fields": {}}]
+        with fake_home() as home:
+            folder = home / ".config" / ".jira"
+            folder.mkdir(parents=True, mode=0o700)
+            (home / ".config").chmod(0o700)
+            (folder / ".config.yml").write_text("auth_type: basic\nserver: https://example.atlassian.net\n")
+            self.assertEqual(run(HELPER.cmd_jira_server)["server"], "https://example.atlassian.net")
+            with mock.patch.object(HELPER, "view_output", return_value=(json.dumps(issues).encode(), False)):
+                reply = run(HELPER.cmd_jira_issues)
+            self.assertEqual(reply["issues"], [{
+                "key": "ABC-12", "summary": "Fix login", "status": "To Do", "type": "Bug", "priority": "High",
+                "updated": "2026-10-09T05:24:10.130-04:00", "url": "https://example.atlassian.net/browse/ABC-12"}])
+            with mock.patch.object(HELPER, "view_output", side_effect=HELPER.Denied("Jira CLI unavailable")), \
+                    mock.patch.dict(os.environ, {"JIRA_API_TOKEN": ""}):
+                with self.assertRaisesRegex(HELPER.Denied, "JIRA_API_TOKEN"):
+                    HELPER.cmd_jira_issues()
+            (home / ".bashrc").write_text('export JIRA_API_TOKEN="first"\nexport JIRA_API_TOKEN="tok-123"  # dawere\n')
+            with mock.patch.object(HELPER, "view_output", return_value=(b"[]", False)) as view, \
+                    mock.patch.dict(os.environ, {"JIRA_API_TOKEN": ""}):
+                run(HELPER.cmd_jira_issues)
+            self.assertEqual(view.call_args.kwargs["env"]["JIRA_API_TOKEN"], "tok-123")
+            self.assertNotIn("tok-123", " ".join(view.call_args.args[0]))
+
+    def test_jira_token_only_comes_from_a_plain_literal(self):
+        cases = (('export JIRA_API_TOKEN="abc"', "abc"), ("JIRA_API_TOKEN='a b'", "a b"),
+                 ("  export JIRA_API_TOKEN=abc # note", "abc"), ('export JIRA_API_TOKEN="$(cat f)"', None),
+                 ("export JIRA_API_TOKEN=`cat f`", None), ("# export JIRA_API_TOKEN=abc", None))
+        for line, expected in cases:
+            with fake_home() as home, mock.patch.dict(os.environ, {"JIRA_API_TOKEN": ""}):
+                (home / ".bashrc").write_text(line + "\n")
+                env = HELPER._jira_env()
+                self.assertEqual(env and env["JIRA_API_TOKEN"], expected, line)
+        with mock.patch.dict(os.environ, {"JIRA_API_TOKEN": "already"}):
+            self.assertIsNone(HELPER._jira_env())
+
+    def test_tz_converts_known_places_and_ignores_the_rest(self):
+        result = run(HELPER.cmd_tz, ["15:00 utc to tokyo"])["result"]
+        self.assertTrue(result["title"].startswith("00:00 in Tokyo"))
+        self.assertEqual(result["copy"], "00:00")
+        self.assertIn("UTC+0", result["subtitle"])
+        self.assertTrue(run(HELPER.cmd_tz, ["time in buenos aires"])["result"]["title"].endswith("in Buenos Aires"))
+        self.assertTrue(run(HELPER.cmd_tz, ["noon pst to vet"])["result"]["title"].endswith("in VET"))
+        for query in ("3pm in banana", "25:00 in tokyo", "13pm utc to tokyo", "screen time"):
+            self.assertIsNone(run(HELPER.cmd_tz, [query])["result"], query)
+
+    def test_public_ip_copies_only_a_real_address(self):
+        with mock.patch.object(HELPER, "fetch_json", return_value={"ip": "203.0.113.5"}), \
+                mock.patch.object(HELPER, "copy_text") as copy, mock.patch.object(HELPER, "notify"):
+            self.assertEqual(run(HELPER.cmd_public_ip)["ip"], "203.0.113.5")
+        copy.assert_called_once_with("203.0.113.5")
+        with mock.patch.object(HELPER, "fetch_json", return_value={"ip": "<script>"}), \
+                mock.patch.object(HELPER, "copy_text") as copy, mock.patch.object(HELPER, "notify"):
+            with self.assertRaises(HELPER.Denied):
+                HELPER.cmd_public_ip()
+        copy.assert_not_called()
+
+    def test_sysinfo_reports_the_basics(self):
+        labels = [item["label"] for item in run(HELPER.cmd_sysinfo)["items"]]
+        for label in ("Hostname", "Kernel", "Memory"):
+            self.assertIn(label, labels)
+        self.assertFalse([label for label in labels if label.startswith(("IP · docker", "IP · br-", "IP · lo"))])
+
+    def test_uuids_are_random_v4(self):
+        uuids = run(HELPER.cmd_uuids)["uuids"]
+        self.assertEqual(len(set(uuids)), 5)
+        self.assertTrue(all(u[14] == "4" for u in uuids))
+
 if __name__ == "__main__":
     unittest.main()
